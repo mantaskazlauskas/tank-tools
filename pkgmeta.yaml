@@ -1,0 +1,10 @@
+package-as: TankWatch
+ignore:
+  - deploy.py
+  - release.py
+  - README.md
+  - .vscode
+  - .github
+  - .venv
+  - __pycache__
+  - .luarc.json

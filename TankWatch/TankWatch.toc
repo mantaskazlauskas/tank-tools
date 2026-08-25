@@ -1,0 +1,12 @@
+## Interface: 120000, 120001, 120005, 120007, 120100
+## Title: TankWatch
+## Notes: Compact threat list for tanks: shows every engaged enemy, who is about to pull it, and alerts the moment you lose one.
+## Author: mmantas
+## Version: 1.0.0
+## SavedVariables: TankWatchDB
+## OptionalDeps: EllesmereUI
+## Category: Combat
+
+TankWatch.lua
+TankWatch_Nameplates.lua
+TankWatch_Options.lua

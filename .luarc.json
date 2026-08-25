@@ -1,0 +1,71 @@
+{
+  "$schema": "https://raw.githubusercontent.com/LuaLS/vscode-lua/master/setting/schema.json",
+  "runtime": {
+    "version": "Lua 5.1"
+  },
+  "diagnostics": {
+    "globals": [
+      "_G",
+
+      "C_NamePlate",
+      "C_SpecializationInfo",
+      "CreateFrame",
+      "DEFAULT_CHAT_FRAME",
+      "GameFontNormal",
+      "GetNumGroupMembers",
+      "GetSpecialization",
+      "GetSpecializationRole",
+      "GetTime",
+      "HideUIPanel",
+      "IsInRaid",
+      "PlaySound",
+      "SOUNDKIT",
+      "Settings",
+      "SettingsPanel",
+      "SlashCmdList",
+      "UIParent",
+      "UISpecialFrames",
+      "UNKNOWN",
+
+      "UnitAffectingCombat",
+      "UnitCanAttack",
+      "UnitClassification",
+      "UnitDetailedThreatSituation",
+      "UnitExists",
+      "UnitGUID",
+      "UnitGroupRolesAssigned",
+      "UnitIsDead",
+      "UnitIsPlayer",
+      "UnitIsUnit",
+      "UnitName",
+      "UnitPlayerOrPetInParty",
+      "UnitPlayerOrPetInRaid",
+
+      "format",
+      "strlower",
+      "strsplit",
+      "strtrim",
+      "strupper",
+      "tinsert",
+      "wipe",
+
+      "EllesmereUI",
+
+      "SLASH_TANKWATCH1",
+      "SLASH_TANKWATCH2",
+      "TankWatch",
+      "TankWatchDB"
+    ],
+    "disable": [
+      "inject-field",
+      "undefined-field"
+    ]
+  },
+  "workspace": {
+    "ignoreDir": [
+      ".vscode",
+      ".venv",
+      ".github"
+    ]
+  }
+}
