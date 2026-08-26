@@ -1,8 +1,9 @@
-package-as: TankWatch
+package-as: TankTools
 ignore:
   - deploy.py
   - release.py
   - README.md
+  - assets
   - .vscode
   - .github
   - .venv

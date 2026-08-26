@@ -51,10 +51,10 @@
 
       "EllesmereUI",
 
-      "SLASH_TANKWATCH1",
-      "SLASH_TANKWATCH2",
-      "TankWatch",
-      "TankWatchDB"
+      "SLASH_TANKTOOLS1",
+      "SLASH_TANKTOOLS2",
+      "TankTools",
+      "TankToolsDB"
     ],
     "disable": [
       "inject-field",

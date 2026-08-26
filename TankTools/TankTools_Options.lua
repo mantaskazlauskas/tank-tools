@@ -1,12 +1,12 @@
 --------------------------------------------------------------------------------
--- TankWatch -- settings window
+-- Tank Tools -- settings window
 --
 -- A standalone, movable panel rather than a page inside Blizzard's Settings
 -- frame, for one practical reason: most of these options are things you judge
--- by looking at the result. Scale, width, marker size and marker anchor all
--- want the live frame visible while you drag the slider, and the Settings
--- window covers most of the screen. A small floating panel lets you see what
--- you are changing.
+-- by looking at the result. Marker size, position, symbol and color all want
+-- real nameplates visible while you drag the slider, and the Settings window
+-- covers most of the screen. A small floating panel lets you see what you are
+-- changing -- turn on the preview and adjust against live plates.
 --
 -- A stub page IS registered under ESC > Options > AddOns so the addon is
 -- discoverable in the usual place; it just opens this window.
@@ -24,7 +24,7 @@ local floor, abs = math.floor, math.abs
 local format     = string.format
 local tinsert    = table.insert
 
-local skin          -- EllesmereUI facade, if the user has skinning on
+local skin          -- host UI skinning facade, if one is present
 local panel         -- the window
 local controls = {} -- everything with a :Refresh(), replayed by RefreshOptions
 
@@ -201,11 +201,14 @@ end
 
 -- Color swatches. Deliberately NOT skinned: a swatch has to show its own
 -- color, which is the one case the skinning guide says to draw yourself.
-local function Swatches(parent, x, y, text, key, onChange)
+local function Swatches(parent, x, y, text, key, onChange, order)
     local lbl = Label(parent, text, 12)
     lbl:SetPoint("TOPLEFT", x, y)
 
-    local order = { "white", "yellow", "cyan", "magenta", "orange" }
+    -- The nameplate module owns the palette and decides which slice of it
+    -- suits each swatch row -- loud presets for the alert glyphs, quiet ones
+    -- for the aggro glyph.
+    order = order or ns.COLOR_ORDER or { "white", "yellow", "cyan", "magenta", "orange" }
     local presets = ns.COLOR_PRESETS or {}
     local buttons = {}
     local size, gap = 26, 6
@@ -222,7 +225,10 @@ local function Swatches(parent, x, y, text, key, onChange)
             tex:SetPoint("BOTTOMRIGHT", -2, 2)
             tex:SetColorTexture(c[1], c[2], c[3], 1)
 
-            local ring = b:CreateTexture(nil, "OVERLAY")
+            -- BACKGROUND, below the 2px-inset color above it, so this reads
+            -- as a border around the swatch. At OVERLAY it covered the colour
+            -- outright and every selected swatch rendered solid white.
+            local ring = b:CreateTexture(nil, "BACKGROUND")
             ring:SetAllPoints()
             ring:SetColorTexture(1, 1, 1, 1)
             ring:Hide()
@@ -257,41 +263,59 @@ local function Swatches(parent, x, y, text, key, onChange)
     return y - 46
 end
 
-local function Input(parent, x, y, text, key, onChange)
+-- Several one-character fields on a single line. The glyphs are chosen
+-- against each other -- the whole point is that the three silhouettes stay
+-- distinct -- so they belong side by side, and the column has no vertical room
+-- for three stacked fields anyway.
+local function InputRow(parent, x, y, text, specs, onChange)
     local lbl = Label(parent, text, 12)
     lbl:SetPoint("TOPLEFT", x, y)
 
-    local eb = CreateFrame("EditBox", nil, parent, "InputBoxTemplate")
-    eb:SetSize(60, 20)
-    eb:SetPoint("TOPLEFT", x + 6, y - 16)
-    eb:SetAutoFocus(false)
-    eb:SetMaxLetters(8)
-    eb:SetFontObject("GameFontHighlight")
+    local n   = #specs
+    local gap = 8
+    local bw  = (COL_W - gap * (n - 1)) / n
 
-    local function commit()
-        local v = strtrim(eb:GetText() or "")
-        if v ~= "" then
-            ns.db[key] = v
-            if onChange then onChange() end
+    for i = 1, n do
+        local spec = specs[i]
+        local bx   = x + (i - 1) * (bw + gap)
+
+        local sub = Label(parent, spec.label, 11, 0.6, 0.6, 0.6)
+        sub:SetPoint("TOPLEFT", bx + 6, y - 17)
+
+        local eb = CreateFrame("EditBox", nil, parent, "InputBoxTemplate")
+        eb:SetSize(bw - 14, 20)
+        eb:SetPoint("TOPLEFT", bx + 6, y - 31)
+        eb:SetAutoFocus(false)
+        eb:SetMaxLetters(8)
+        eb:SetFontObject("GameFontHighlight")
+
+        local function commit()
+            local v = strtrim(eb:GetText() or "")
+            -- An empty glyph would be a marker that shows nothing, which reads
+            -- exactly like the marker being broken. Refuse it and snap back.
+            if v ~= "" then
+                ns.db[spec.key] = v
+                if onChange then onChange() end
+            end
+            eb:ClearFocus()
+            ns.RefreshOptions()
         end
-        eb:ClearFocus()
-        ns.RefreshOptions()
+
+        eb:SetScript("OnEnterPressed", commit)
+        eb:SetScript("OnEditFocusLost", commit)
+        eb:SetScript("OnEscapePressed", function()
+            eb:ClearFocus()
+            ns.RefreshOptions()
+        end)
+
+        eb.Refresh = function()
+            if not eb:HasFocus() then eb:SetText(ns.db[spec.key] or "") end
+        end
+        controls[#controls + 1] = eb
+        if skin then skin.EditBox(eb) end
     end
 
-    eb:SetScript("OnEnterPressed", commit)
-    eb:SetScript("OnEditFocusLost", commit)
-    eb:SetScript("OnEscapePressed", function()
-        eb:ClearFocus()
-        ns.RefreshOptions()
-    end)
-
-    eb.Refresh = function()
-        if not eb:HasFocus() then eb:SetText(ns.db[key] or "") end
-    end
-    controls[#controls + 1] = eb
-    if skin then skin.EditBox(eb) end
-
-    return y - 44
+    return y - 58
 end
 
 --------------------------------------------------------------------------------
@@ -299,8 +323,8 @@ end
 --------------------------------------------------------------------------------
 
 local function BuildPanel()
-    local f = CreateFrame("Frame", "TankWatchOptionsFrame", UIParent, "BackdropTemplate")
-    f:SetSize(PAD * 3 + COL_W * 2, 500)
+    local f = CreateFrame("Frame", "TankToolsOptionsFrame", UIParent, "BackdropTemplate")
+    f:SetSize(PAD * 3 + COL_W * 2, 410)
     f:SetPoint("CENTER")
     f:SetFrameStrata("DIALOG")
     f:SetClampedToScreen(true)
@@ -319,12 +343,12 @@ local function BuildPanel()
     f:SetScript("OnDragStop", f.StopMovingOrSizing)
 
     -- Escape closes it, like every other WoW panel.
-    tinsert(UISpecialFrames, "TankWatchOptionsFrame")
+    tinsert(UISpecialFrames, "TankToolsOptionsFrame")
 
     f.title = f:CreateFontString(nil, "OVERLAY")
     f.title:SetFont(FontPath(), 15, "OUTLINE")
     f.title:SetTextColor(1, 1, 1)
-    f.title:SetText("TankWatch")
+    f.title:SetText("Tank Tools")
     f.title:SetPoint("TOPLEFT", PAD, -12)
 
     f.close = CreateFrame("Button", nil, f, "UIPanelCloseButton")
@@ -335,36 +359,35 @@ local function BuildPanel()
 end
 
 local function BuildContents(f)
-    local applyDisplay = ns.ApplyDisplay
-    local applyLock    = ns.ApplyLock
     local applyMarkers = ns.MarkersLooksChanged
 
     ----------------------------------------------------------------- left ----
     local x, y = PAD, -42
 
-    y = Header(f, "The list", x, y)
-    y = Check(f, x, y, "Lock frame (click-through)", "locked", applyLock)
-    y = Slider(f, x, y, "Scale", "scale", 0.5, 2.0, 0.05, 2, applyDisplay)
-    y = Slider(f, x, y, "Width", "width", 120, 600, 10, 0, applyDisplay)
-    y = Slider(f, x, y, "Max rows", "maxRows", 1, 40, 1, 0)
+    y = Header(f, "Markers", x, y)
+    -- The three states are independent switches rather than a master plus two
+    -- extras, so "only tell me which ones are mine" is a setting you can
+    -- actually reach.
+    y = Check(f, x, y, "Mark mobs I do NOT have aggro on", "npMarker", applyMarkers)
+    y = Check(f, x, y, "Mark mobs at risk of being pulled", "npMarkerWarn", applyMarkers)
+    y = Check(f, x, y, "Mark mobs I DO have aggro on", "npMarkerSecure", applyMarkers)
+    y = Check(f, x, y, "Pulse (alert markers only)", "npPulse", applyMarkers)
 
-    y = y - 8
-    y = Header(f, "When to show it", x, y)
+    y = y - 10
+    y = Header(f, "General", x, y)
     y = Check(f, x, y, "Only in a tank spec", "onlyTankSpec")
-    y = Check(f, x, y, "Only in combat", "onlyInCombat")
-    y = Check(f, x, y, "Hide while everything is secure", "hideWhenClean")
-    y = Check(f, x, y, "Sound when a mob is lost", "sound")
-    y = y - 6
-    y = Slider(f, x, y, "Warn at rival threat %", "warnThreshold", 1, 100, 1, 0)
+    y = Check(f, x, y, "Sound when a mob stops being yours", "sound")
+
+    y = y - 10
+    local note = Label(f, "The markers signal by shape and by appearing at all,\nnot by color, so they stay readable in grayscale.",
+                       11, 0.6, 0.6, 0.6)
+    note:SetPoint("TOPLEFT", x, y)
+    note:SetJustifyH("LEFT")
 
     ---------------------------------------------------------------- right ----
     local rx, ry = PAD * 2 + COL_W, -42
 
-    ry = Header(f, "Nameplate marker", rx, ry)
-    ry = Check(f, rx, ry, "Mark mobs I do not have", "npMarker", applyMarkers)
-    ry = Check(f, rx, ry, "Also mark mobs at risk", "npMarkerWarn", applyMarkers)
-    ry = Check(f, rx, ry, "Pulse", "npPulse", applyMarkers)
-    ry = ry - 6
+    ry = Header(f, "Appearance", rx, ry)
     ry = Slider(f, rx, ry, "Marker size", "npSize", 10, 72, 1, 0, applyMarkers)
     ry = Segmented(f, rx, ry, "Position", "npAnchor", {
         { text = "Left",   value = "LEFT"   },
@@ -372,12 +395,18 @@ local function BuildContents(f)
         { text = "Top",    value = "TOP"    },
         { text = "Bottom", value = "BOTTOM" },
     }, applyMarkers)
-    ry = Swatches(f, rx, ry, "Color", "npColor", applyMarkers)
-    ry = Input(f, rx, ry, "Symbol", "npGlyph", applyMarkers)
+    ry = InputRow(f, rx, ry, "Symbols", {
+        { label = "Not mine", key = "npGlyph"       },
+        { label = "At risk",  key = "npWarnGlyph"   },
+        { label = "Mine",     key = "npSecureGlyph" },
+    }, applyMarkers)
+    ry = Swatches(f, rx, ry, "Alert color", "npColor", applyMarkers, ns.COLOR_ORDER)
+    ry = Swatches(f, rx, ry, "Aggro color", "npSecureColor", applyMarkers,
+                  ns.COLOR_ORDER_SECURE)
 
-    -- Preview lives next to the marker settings rather than with the bottom
-    -- buttons: it exists to be toggled while adjusting size and position, and
-    -- every slider it relates to is directly above it.
+    -- Preview lives with the appearance settings rather than off in a button
+    -- bar: it exists to be toggled while adjusting size and position, and
+    -- every control it relates to is directly above it.
     local prev = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
     prev:SetSize(COL_W, 22)
     prev:SetPoint("TOPLEFT", rx, ry)
@@ -394,46 +423,10 @@ local function BuildContents(f)
     if skin then skin.Button(prev) end
     ry = ry - 28
 
-    local pnote = Label(f, "Marks every enemy nameplate so you can size and place\nthe symbol on a target dummy. Ends when you change zone.",
+    local pnote = Label(f, "Marks every enemy nameplate so you can size and place the\nsymbols on a target dummy -- each enabled symbol is spread\nover the mobs on screen. Ends when you change zone.",
                         11, 0.55, 0.55, 0.55)
     pnote:SetPoint("TOPLEFT", rx, ry)
     pnote:SetJustifyH("LEFT")
-    ry = ry - 32
-
-    local note = Label(f, "The marker signals by shape and by appearing at all,\nnot by color, so it stays readable in grayscale.",
-                       11, 0.6, 0.6, 0.6)
-    note:SetPoint("TOPLEFT", rx, ry - 4)
-    note:SetJustifyH("LEFT")
-
-    ------------------------------------------------------------- buttons ----
-    local test = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-    test:SetSize(120, 22)
-    test:SetPoint("BOTTOMLEFT", PAD, PAD - 4)
-    test:SetScript("OnClick", function()
-        ns.SetTestMode(not ns.GetTestMode())
-        ns.RefreshOptions()
-    end)
-    test.Refresh = function()
-        test:SetText(ns.GetTestMode() and "Stop preview" or "Preview layout")
-    end
-    controls[#controls + 1] = test
-
-    local reset = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-    reset:SetSize(120, 22)
-    reset:SetPoint("LEFT", test, "RIGHT", 8, 0)
-    reset:SetText("Reset position")
-    reset:SetScript("OnClick", function()
-        ns.ResetPosition()
-        ns.RefreshOptions()
-    end)
-
-    local hint = Label(f, "Uncheck Lock to drag the list into place.", 11, 0.55, 0.55, 0.55)
-    hint:SetPoint("BOTTOMRIGHT", -PAD, PAD)
-
-    if skin then
-        skin.Button(test)
-        skin.Button(reset)
-    end
 end
 
 --------------------------------------------------------------------------------
@@ -454,7 +447,7 @@ local function SkinPanel()
     if not (skin and panel) or panel._skinned then return end
     panel._skinned = true
     -- Our own backdrop must go first: S.Shell fades texture regions, and a
-    -- backdrop is not one, so it would show through the EUI shell.
+    -- backdrop is not one, so it would show through the skinned shell.
     panel:SetBackdrop(nil)
     skin.Shell(panel)
     skin.Font(panel.title)
@@ -466,10 +459,10 @@ function ns.ShowOptions()
     if not panel then
         BuildPanel()
         BuildContents(panel)
-        -- The panel is built lazily, on first open, which is long after the
-        -- EUI skin callback has already run. Skinning here is what actually
+        -- The panel is built lazily, on first open, which is long after any
+        -- skin callback has already run. Skinning here is what actually
         -- catches it; the callback below only matters if the window happens to
-        -- already exist when EUI drains its queue.
+        -- already exist when the host UI drains its queue.
         SkinPanel()
     end
     panel:Show()
@@ -485,15 +478,15 @@ function ns.ToggleOptions()
 end
 
 --------------------------------------------------------------------------------
--- EllesmereUI skin + Blizzard Settings entry
+-- Optional skinning + Blizzard Settings entry
 --------------------------------------------------------------------------------
 
 if EllesmereUI and EllesmereUI.RegisterSkin then
-    EllesmereUI.RegisterSkin("TankWatchOptions", function(S)
+    EllesmereUI.RegisterSkin("TankToolsOptions", function(S)
         -- Keeping S is the important part: the window is built on first open,
         -- normally well after this runs, and every widget constructor calls
-        -- these primitives itself. That is the pattern the EUI guide gives for
-        -- lazily created frames.
+        -- these primitives itself -- the usual pattern for lazily created
+        -- frames.
         skin = S
         if not panel then return end
 
@@ -519,30 +512,30 @@ local function RegisterSettingsStub()
     end
 
     local holder = CreateFrame("Frame")
-    holder.name = "TankWatch"
+    holder.name = "Tank Tools"
 
     local title = holder:CreateFontString(nil, "OVERLAY")
     title:SetFont(FontPath(), 17, "OUTLINE")
     title:SetPoint("TOPLEFT", 12, -14)
-    title:SetText("TankWatch")
+    title:SetText("Tank Tools")
 
     local desc = holder:CreateFontString(nil, "OVERLAY")
     desc:SetFont(FontPath(), 12, "")
     desc:SetTextColor(0.75, 0.75, 0.75)
     desc:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -8)
-    desc:SetText("TankWatch's settings open in their own window, so you can see\nthe threat list change while you adjust it.")
+    desc:SetText("These settings open in their own window, so you can see\nthe threat list change while you adjust it.")
     desc:SetJustifyH("LEFT")
 
     local open = CreateFrame("Button", nil, holder, "UIPanelButtonTemplate")
     open:SetSize(200, 24)
     open:SetPoint("TOPLEFT", desc, "BOTTOMLEFT", 0, -16)
-    open:SetText("Open TankWatch settings")
+    open:SetText("Open Tank Tools settings")
     open:SetScript("OnClick", function()
         if SettingsPanel and SettingsPanel:IsShown() then HideUIPanel(SettingsPanel) end
         ns.ShowOptions()
     end)
 
-    local category = Settings.RegisterCanvasLayoutCategory(holder, "TankWatch")
+    local category = Settings.RegisterCanvasLayoutCategory(holder, "Tank Tools")
     Settings.RegisterAddOnCategory(category)
 end
 

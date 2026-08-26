@@ -17,16 +17,16 @@ jobs:
 
       - name: Debug zip file name
         run: |
-          echo "Expected zip: TankWatch-${{ github.ref_name }}.zip"
+          echo "Expected zip: TankTools-${{ github.ref_name }}.zip"
           ls -lh
 
       - name: Create Addon ZIP
         run: |
-          zip -r "TankWatch-${{ github.ref_name }}.zip" TankWatch
+          zip -r "TankTools-${{ github.ref_name }}.zip" TankTools
 
       - name: Upload ZIP to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: "TankWatch-${{ github.ref_name }}.zip"
+          files: "TankTools-${{ github.ref_name }}.zip"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,12 @@
+## Interface: 120000, 120001, 120005, 120007, 120100
+## Title: Tank Tools
+## Notes: Marks enemy nameplates by threat: which ones are on someone else, so you can taunt them off.
+## Author: mmantas
+## Version: 1.0.0
+## SavedVariables: TankToolsDB
+## OptionalDeps: EllesmereUI
+## Category: Combat
+
+TankTools.lua
+TankTools_Nameplates.lua
+TankTools_Options.lua

@@ -52,7 +52,7 @@ def find_addon_source():
     if not matches:
         print("ERROR: No addon folder found next to this script.")
         print("       Expected a subdirectory containing a matching .toc file,")
-        print("       e.g. TankWatch/TankWatch.toc")
+        print("       e.g. TankTools/TankTools.toc")
         sys.exit(1)
 
     if len(matches) > 1:
