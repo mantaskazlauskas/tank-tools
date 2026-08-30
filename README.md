@@ -9,15 +9,24 @@ dependencies, no embedded libraries, works on the default UI.
 
 ## What it does
 
-One question, answered as fast as possible: **which enemy is on someone else,
-so I can taunt it off?**
+Two questions, answered as fast as possible.
+
+**Which enemy is on someone else, so I can taunt it off?**
 
 A bright **`!`** appears next to the nameplate of every enemy you do **not**
-have aggro on. Nothing on screen means everything is yours.
+have aggro on. Nothing on screen means everything is yours. There is no threat
+meter, no list, no percentages — see
+[Secret values](#secret-values-midnight-and-later) for why those cannot work
+inside an instance, and why none of them is what a tank acts on anyway.
 
-That is the whole addon. There is no threat meter, no list, no percentages —
-see [Secret values](#secret-values-midnight-and-later) for why those cannot
-work inside an instance, and why none of them is what a tank acts on anyway.
+**How many stacks does the other tank have, and is it my turn?**
+
+A small panel puts you and your co-tanks side by side — health, boss debuffs
+with their stack counts, and a ring around whoever is currently holding the
+boss. The debuffs are drawn by the game's own aura display, which is what keeps
+them on screen inside an encounter. See [The co-tank panel](#the-co-tank-panel).
+
+Both are optional and independent; turn either off and the other is untouched.
 
 ## The three markers
 
@@ -60,6 +69,120 @@ Every one of those survives being rendered in pure grayscale. Color is
 decoration applied last — turn the monitor monochrome and the marker still
 works perfectly. Every state is a differently *shaped* glyph, never a recolored
 one, so no two ever rely on being told apart by hue.
+
+## The co-tank panel
+
+> **Not finished, and hidden.** The panel is behind a feature flag and is off
+> for everyone. Turn it on in **`/tt features`** and reload. Nothing else in
+> the addon mentions it: no commands in the help, no tab in the settings
+> window, no lines in `/tt status`, and its module is never started. See
+> [Features in progress](#features-in-progress).
+
+
+You and every other tank in the group -- health, debuffs, and
+which of you is actually holding the boss.
+
+```
+  side by side                        stacked
+
+  Tankadin      94%   Bearbutt  81%   Tankadin      94%
+  ##########>..[7][2] #######...[3]   ##########>..[7][2]
+               ^ drawn by the        Bearbutt      81%
+                 game, nearest        #######......[3]
+                 the bar first
+```
+
+- **Debuffs are drawn by the game's own aura display.** That is what lets them
+  keep working in a boss fight: since Midnight the client refuses to let an
+  addon enumerate auras during an encounter or a Mythic+, so the panel hands a
+  unit and a filter to the client's aura widget and lets it draw. Tank Tools
+  never learns what the debuff is, and does not need to.
+- **A boss/role filter you can turn on**, off by default. The client's display
+  sorts by time remaining and cannot be asked for "biggest stack first", so the
+  filter is the only way to stop procs crowding the tank debuff off the end of a
+  five-icon row. It ships off anyway, because the engine never reports what it
+  dropped -- a filter that matches nothing looks exactly like a tank with no
+  debuffs, and showing too much is recoverable by looking while showing nothing
+  is not. DBM ships its equivalent off for the same reason.
+- **Tanks sit side by side or stacked**, your choice — a row across the top of
+  the screen, or a column down the side.
+- **Debuffs sit left or right of the bar**, also your choice. They are laid out
+  outward from the bar either way, so the icon you watch does not move when you
+  flip the side.
+- **A ring marks whoever is holding a boss.** `UnitThreatSituation` against
+  `boss1`-`boss5` stays readable inside an instance, so this keeps working where
+  most threat UI cannot. The signal is the ring *being there*, not its colour.
+- **Hover an icon for its tooltip**, the same as any other debuff — the client's
+  display supplies it, which is the only way to get one for an aura the addon
+  is not allowed to identify. `/tt twtips` turns it off if you would rather the
+  icons not take the mouse at all.
+- Absorbs draw on top of the health fill, never past it -- a shielded tank at
+  40% is not a tank at 60%.
+
+It hides itself below two tanks in the group. `/tt twtest` fills it with three
+copies of you so you can place and size it solo, and `/tt twlock` puts the drag
+handle away.
+
+`/tt twsolo` turns on a second exception: inside a five-man, show the panel even
+though you are the only tank. A dungeon is the cheap place to find out what the
+client will actually hand over -- your own bar goes through the same reads and
+the same setters a co-tank's does in a raid, so debuffs that render on you there
+will render on them when it matters. It applies to party instances only, so the
+panel does not follow you into the open world or a battleground.
+
+### Why it survives Midnight
+
+Health, names and absorbs go into a frame setter **unread** -- `SetText`,
+`SetValue` and `SetMinMaxValues` all accept a secret value, so the bar fills
+correctly without the addon knowing what the numbers are. Three things
+genuinely need arithmetic, and each degrades on its own:
+
+| Needs a real value | Without one |
+|---|---|
+| the `94%` text | blank |
+| the absorb overlay | absent |
+| class-coloured names | white |
+
+**Auras are not like that, and assuming they were is why this panel used to go
+blank.** The first version read debuffs the same way it reads health -- walk the
+aura indices, hand each field to a setter unread -- on the assumption that a
+restricted aura would arrive as a secret value. It does not. Inside an encounter
+or a Mythic+ the client refuses the *enumeration itself*: the call throws, and
+there is no value to launder. Three throws in a row latched the whole panel off,
+which is exactly what "no debuff icons across two boss fights" was.
+
+So the addon no longer reads auras at all. An `AuraContainer` -- the client's own
+aura display, the same widget DBM uses for its tank and co-tank icons -- is told
+which unit and which filter, and draws into regions the addon owns: a texture, a
+cooldown, a font string for the stack count. The count on screen is real and the
+addon never saw it.
+
+Two things are given up for that, and neither is worked around:
+
+| Lost | Why |
+|---|---|
+| sorting by stack count | the display sorts by time left, and takes no other order. The boss/role filter is the mitigation. |
+| knowing how many icons are up | the addon is not told. `/tt cotanks` says so rather than printing a zero. |
+
+On a client with no aura display widget the row falls back to reading auras
+itself, sorting by stacks as before -- correct wherever it is allowed, and
+silent rather than throwing where it is not.
+
+**`/tt cotanks`** reports which of the two is running, and whether the
+restriction is on right now:
+
+```
+aura engine=yes   auras restricted right now=yes
+UnitInRaid(player)=nil  ->  we are drawn as player
+raid2  name=Bearbutt
+    health=81 / 100   absorbs=6
+    class=DRUID  dead=false  connected=true
+    debuffs: drawn by the game's aura engine (count not knowable, and does not need to be)
+    direct read: denied -- the client refuses aura enumeration here
+```
+
+That last pair of lines is the whole diagnosis in one place: the read the addon
+is no longer allowed to make, and the display that is drawing anyway.
 
 ## Setup
 
@@ -188,6 +311,7 @@ typing, and for macros.
 | `/tt nptest` | preview the symbols on every enemy nameplate |
 | `/tt status` | why is nothing marking? |
 | `/tt debug` | dump every nameplate the scan sees, and why each was skipped |
+| `/tt cotanks` | dump what every co-tank read returns, and how debuffs are being drawn |
 | `/tt np` | toggle the "not mine" marker |
 | `/tt npwarn` | toggle the "at risk" marker |
 | `/tt npsecure` | toggle the "mine" marker |
@@ -199,8 +323,19 @@ typing, and for macros.
 | `/tt npsecglyph <text>` | "mine" symbol (default `o`) |
 | `/tt npcolor <name>` | alert color — white / yellow / cyan / magenta / orange / green / grey |
 | `/tt npseccolor <name>` | aggro marker color, same presets |
+| `/tt tw` | toggle the co-tank panel |
+| `/tt twlock` | lock the panel and hide its drag handle |
+| `/tt twtest` | show the panel with placeholder tanks |
+| `/tt twsolo` | show the panel in dungeons when you are the only tank |
+| `/tt twlayout <l>` | tanks side by side (`row`) or stacked (`column`) |
+| `/tt twanchor <side>` | debuffs on the left / right of the bar |
+| `/tt twtips` | toggle debuff tooltips on hover |
 | `/tt sound` | toggle the lost-mob sound |
 | `/tt tankonly` | toggle tank-spec-only |
+
+The `tw*` rows and `/tt cotanks` exist only while the co-tank panel's feature
+flag is on. With it off they are not listed by `/tt` and do not dispatch --
+see [Features in progress](#features-in-progress).
 
 ## Compatibility
 
@@ -239,12 +374,27 @@ setup.
 ## Development
 
 ```
-tank-watch/
+tank-tools/
   TankTools/                  the addon itself -- this folder is what ships
-    TankTools.toc
-    TankTools.lua             threat scan, alerts, slash commands, diagnostics
-    TankTools_Nameplates.lua  the markers themselves
-    TankTools_Options.lua     settings window
+    TankTools.toc            load order, and the only place it is written down
+    Core/
+      Namespace.lua          the namespace, the module registry, shared state
+      Secret.lua             Clean / IsTrue / IsFalse -- every restricted read
+      Events.lua             one event frame, dispatched in .toc order
+      DB.lua                 saved variables, per-module, with migration
+      State.lua              roster cache, role, combat and instance flags
+      Ticker.lua             one OnUpdate, one failure latch per subscriber
+      Commands.lua           slash registry, generated help, /tt status
+      Features.lua           flags for modules that are not finished yet
+    UI/
+      Widgets.lua            checkbox, slider, segmented picker, swatches
+      Options.lua            the settings window; modules register sections
+      Features.lua           the /tt features window
+    Modules/
+      Threat.lua             the scan -- produces state, draws nothing
+      Nameplates.lua         the markers themselves
+      TankWatch.lua          the co-tank panel
+  tests/                      loads the addon into real Lua 5.1, no WoW needed
   assets/                     logo + the script that renders it (not shipped)
   deploy.py                   copy into a live WoW install for testing
   release.py                  tag + GitHub release from the .toc version
@@ -253,6 +403,145 @@ tank-watch/
 ```
 
 Tooling is shared with the ChattyLittleNpc repos, so it behaves identically.
+
+### Tests
+
+```
+pip install lupa
+python tests/run.py                 # every suite, every scenario
+python tests/run.py tankwatch       # one suite
+python tests/run.py core:migrate    # one scenario
+```
+
+`tests/harness.lua` stubs `CreateFrame`, the `Unit*` calls, events and the
+ticker, then loads every file the `.toc` lists, **in `.toc` order**. Nothing is
+mocked out: what runs is the shipping code, in a real Lua 5.1 interpreter.
+
+Scenarios set up a different world before the addon loads:
+
+| Scenario | Sets up |
+|---|---|
+| `core:fresh` | a clean install |
+| `core:migrate` | an existing v1 (flat) saved-variables table |
+| `core:tabs` | a third module registering a settings page |
+| `tankwatch:fresh` | a raid with three tanks, the co-tank flag set |
+| `tankwatch:secret` | the same raid with **every identity read restricted** |
+| `tankwatch:engine` | the same raid with an **aura display widget present and aura reads denied outright** -- a boss fight. The icons must be on screen and the addon must not have touched an aura API. |
+
+The last two are the important ones, and they model two *different*
+restrictions. `WORLD.secretMode = true` makes every `Unit*` call return a secret
+value; the suite then asserts the panel still renders, that health still reaches
+the bar unread, and that only the documented things degrade.
+`WORLD.aurasSecret = true` is harsher and closer to what a boss fight actually
+does: the aura calls **throw**. Any code that walks aura indices fails the suite
+outright, which is the regression that motivated the aura display in the first
+place.
+
+### How a module is put together
+
+Core owns four things and nothing else: a database, a ticker, an event
+dispatcher and a settings window. A module declares what it wants from each and
+never reaches into another module. The point is that a broken or removed module
+costs you that module and nothing more.
+
+```lua
+local M = ns.NewModule("mymodule", {
+    defaults = { enabled = true },     -- lives at TankToolsDB.modules.mymodule
+})
+
+function M:OnInit()                    -- after self.db exists, before any event
+    ns.RegisterTicker("mymodule", "watch", 0.2, Tick)
+    ns.RegisterEvent("GROUP_ROSTER_UPDATE", Rebuild)
+end
+
+ns.RegisterCommand{ name = "mine", section = "other:", order = 30,
+                    desc = "toggle it", handler = Toggle }
+
+ns.RegisterStatusProvider(30, function(yn) ... end)
+
+ns.RegisterOptionsSection{ page = "My Page", pageOrder = 20,
+                           column = "left", order = 10, build = Build }
+```
+
+Registration is declarative and happens at load time; nothing *runs* until
+`ADDON_LOADED` has resolved the database. The help text, `/tt status` and the
+settings window are all generated from these registrations, so a feature that
+exists is a feature that is listed.
+
+The settings window grows a tab strip automatically once a second page is
+registered -- with one page it would be chrome carrying no information.
+
+### Threat state has consumers, not a hardcoded display
+
+`Modules/Threat.lua` produces `ns.stateByUnit` and draws nothing. Anything that
+wants to show it registers:
+
+```lua
+ns.RegisterThreatConsumer{
+    wants   = function() return MarkersWanted(), previewMode end,
+    updated = Redraw,
+}
+```
+
+`wants` also decides whether the scan runs at all this tick, which is what
+keeps the idle cost at a few comparisons. Its second return means "run even
+outside a tank spec", which is what a preview mode needs.
+
+### Features in progress
+
+The addon ships as one folder, so a half-built module still loads, still
+registers its commands, and still puts a tab in the settings window. That is
+fine on a branch and wrong the moment it is tagged: someone finds the feature,
+it misbehaves, and the bug report is about a thing that was never claimed to
+work.
+
+A flag makes the module invisible instead. It declares one, and marks
+everything it registers with the same name:
+
+```lua
+ns.RegisterFeature{
+    name    = "cotanks",
+    title   = "Co-tank panel",
+    default = false,
+    desc    = "one or more lines, shown under the checkbox",
+}
+
+local M = ns.NewModule("tankwatch", { feature = "cotanks", defaults = { ... } })
+
+ns.RegisterCommand{ name = "tw", feature = "cotanks", ... }
+ns.RegisterStatusProvider(30, Report, "cotanks")
+ns.RegisterOptionsSection{ page = "Co-tanks", feature = "cotanks", ... }
+```
+
+With the flag unset:
+
+| | |
+|---|---|
+| `OnInit` / `OnEnable` | never called -- no ticker, no events, nothing running |
+| its commands | not listed in the help, and dispatch as if unregistered |
+| its settings page | dropped, and an empty tab goes with it |
+| its status lines | not printed |
+| its settings | still created and still defaulted |
+
+The file stays in the `.toc`. That is the point: it is still compiled on every
+load and its suite still runs, so a gated module cannot quietly rot.
+
+**`/tt features`** is the window that sets the flags. It is registered
+`hidden = true`, so it is the one command the generated help does not list --
+this is a door for the author, not a beta programme. Flags are per character
+and saved like any other setting.
+
+A flag is read once, at load. Turning one on takes effect on the next
+`/reload`, and the window says so. Enabling live would be easy -- call
+`OnInit` -- but disabling live is not: a ticker cannot be unregistered and an
+event handler cannot be taken back, and a switch that works in one direction
+only is worse than one that is honest about needing a reload.
+
+Unregistered names are **enabled**. Gating is opt-in, so deleting a
+`RegisterFeature` call ships the feature even if a `feature = "..."` field is
+left behind somewhere -- failing the other way would let a half-finished
+cleanup hide a shipped feature, which is the expensive direction of that
+mistake.
 
 ### Deploying to a live WoW install
 

@@ -7,18 +7,30 @@
     "globals": [
       "_G",
 
+      "AnchorUtil",
+      "AuraContainerSortDirection",
+      "AuraContainerSortMethod",
+      "AuraUtil",
+      "C_AddOns",
       "C_NamePlate",
+      "C_Secrets",
+      "C_UnitAuras",
       "C_SpecializationInfo",
       "CreateFrame",
       "DEFAULT_CHAT_FRAME",
       "GameFontNormal",
+      "GameTooltip",
       "GetNumGroupMembers",
+      "GetRaidRosterInfo",
       "GetSpecialization",
       "GetSpecializationRole",
       "GetTime",
       "HideUIPanel",
+      "IsInInstance",
       "IsInRaid",
       "PlaySound",
+      "RAID_CLASS_COLORS",
+      "ReloadUI",
       "SOUNDKIT",
       "Settings",
       "SettingsPanel",
@@ -33,13 +45,23 @@
       "UnitDetailedThreatSituation",
       "UnitExists",
       "UnitGUID",
+      "UnitClassBase",
+      "UnitGetTotalAbsorbs",
       "UnitGroupRolesAssigned",
+      "UnitHealth",
+      "UnitHealthMax",
+      "UnitIsConnected",
+      "UnitIsDeadOrGhost",
       "UnitIsDead",
       "UnitIsPlayer",
+      "UnitInRaid",
       "UnitIsUnit",
       "UnitName",
       "UnitPlayerOrPetInParty",
       "UnitPlayerOrPetInRaid",
+      "UnitThreatSituation",
+
+      "issecretvalue",
 
       "format",
       "strlower",
@@ -65,7 +87,8 @@
     "ignoreDir": [
       ".vscode",
       ".venv",
-      ".github"
+      ".github",
+      "tests"
     ]
   }
 }

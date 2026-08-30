@@ -1,12 +1,42 @@
 ## Interface: 120000, 120001, 120005, 120007, 120100
 ## Title: Tank Tools
-## Notes: Marks enemy nameplates by threat: which ones are on someone else, so you can taunt them off.
+## Notes: Marks enemy nameplates by threat, so you can see at a glance what is not yours.
 ## Author: mmantas
-## Version: 1.0.0
+## Version: 1.0.1
 ## SavedVariables: TankToolsDB
 ## OptionalDeps: EllesmereUI
 ## Category: Combat
 
-TankTools.lua
-TankTools_Nameplates.lua
-TankTools_Options.lua
+# Load order is the dependency graph, and it is the only place that graph is
+# written down. Core before UI before Modules; within Core, Namespace first
+# because everything hangs off it, and Events before DB because the database
+# resolves on an event.
+#
+# Within Modules, a module that another one reads goes first: Nameplates reads
+# the threat state ids at file scope.
+#
+# AuraRow is in UI rather than Modules because it is a widget, not a feature:
+# it has no settings, no commands and no lifecycle, and the co-tank panel
+# builds one the same way it builds a status bar.
+#
+# Features sits after DB because a flag is a saved setting like any other, and
+# before State so which modules exist is settled before anything reads the
+# world. Its window is in UI, after the widgets it is built from.
+
+Core\Namespace.lua
+Core\Secret.lua
+Core\Events.lua
+Core\DB.lua
+Core\Features.lua
+Core\State.lua
+Core\Ticker.lua
+Core\Commands.lua
+
+UI\Widgets.lua
+UI\AuraRow.lua
+UI\Options.lua
+UI\Features.lua
+
+Modules\Threat.lua
+Modules\Nameplates.lua
+Modules\TankWatch.lua
