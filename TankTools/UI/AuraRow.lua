@@ -48,11 +48,27 @@ local CreateFrame = CreateFrame
 local floor       = math.floor
 local tsort       = table.sort
 
-local Clean, IsSecret = ns.Clean, ns.IsSecret
+local Clean, IsSecret, Show = ns.Clean, ns.IsSecret, ns.Show
 
 local ui = ns.ui
 
 local MAX_AURA_SCAN = 40   -- the client's own per-unit aura cap
+
+-- How much of the candidate filtering to apply; see CandidateFilters.
+local FILTER_MODES = { normal = true, loose = true, none = true }
+
+-- Every AuraButton setter we know the widget to have had, across the builds it
+-- has shipped in. Nothing here is called blind -- the list exists so the row
+-- can report which of them *this* client actually offers, because the widget
+-- has been renamed under us before (SetDurationCooldown and SetDurationText
+-- have both been the way to hand it a timer) and a decoration aimed at the
+-- wrong name fails silently into a blank icon.
+local BUTTON_METHODS = {
+    "SetIcon", "SetDurationCooldown", "SetDurationText",
+    "SetApplicationCount", "SetApplicationBar", "ClearApplicationCount",
+    "SetAuraBorder", "SetAuraSymbol", "SetCancelAuraButtons",
+    "SetMouseClickEnabled", "SetMouseMotionEnabled",
+}
 
 local FONT = select(1, GameFontNormal:GetFont())
 
@@ -76,16 +92,29 @@ local NEVER_SHOW = {
 --------------------------------------------------------------------------------
 -- The engine, and whether we have one
 --
--- Probed once, by building a container and asking whether it answers the three
--- calls the row needs. A version check would be a guess about which build the
--- widget landed in; this is the question we actually care about.
+-- Probed by building a container and asking whether it answers the three calls
+-- the row needs. A version check would be a guess about which build the widget
+-- landed in; this is the question we actually care about.
 --------------------------------------------------------------------------------
 
-local engine   -- nil = not yet probed, false = absent, true = present
+local engine    -- true once the engine has answered; nil until it has
+local probedAt  -- when the last failed probe ran
+
+local PROBE_RETRY = 5   -- seconds before a failed probe is worth repeating
 
 local function HaveEngine()
-    if engine ~= nil then return engine end
-    engine = false
+    if engine then return true end
+
+    -- A "no" is never remembered for long, for the same reason
+    -- ns.AurasRestricted() never remembers a "yes": the two answers do not
+    -- cost the same. Latching "no engine" for the session sends every row down
+    -- the fallback, and the fallback refuses to draw while auras are
+    -- restricted -- so one unlucky probe leaves the panel blank in exactly the
+    -- content it exists for, and nothing on screen says why. Re-probing costs
+    -- a CreateFrame every few seconds, and only until the answer is yes.
+    local now = GetTime and GetTime() or 0
+    if probedAt and (now - probedAt) < PROBE_RETRY then return false end
+    probedAt = now
 
     if C_AddOns and C_AddOns.LoadAddOn and C_AddOns.IsAddOnLoaded
        and not C_AddOns.IsAddOnLoaded("Blizzard_AuraContainer") then
@@ -100,12 +129,61 @@ local function HaveEngine()
        and type(f.SetAuraGroupMaxFrameCount) == "function" then
         f:Hide()
         engine = true
+        probedAt = nil
+        return true
     end
 
-    return engine
+    return false
 end
 
 ns.HaveAuraEngine = HaveEngine
+
+-- Every container method the row calls, so the probe can say which of them
+-- this client actually has rather than discovering it one silent pcall at a
+-- time. The widget is young and its surface has moved between builds.
+local CONTAINER_METHODS = {
+    "AddAuraGroup", "HasAuraGroup", "SetUnit", "SetEnabled", "UpdateAllAuras",
+    "SetAuraGroupMaxFrameCount", "SetAuraGroupCandidateFilters",
+    "SetAuraGroupLayout", "SetAuraGroupSortMethod",
+    "SetFlowLayoutAxis", "SetFlowLayoutAnchorPoint",
+    "SetFlowLayoutGrowthDirection", "SetFlowLayoutMaximumLineSize",
+}
+
+-- What this client's aura engine actually offers, probed fresh rather than
+-- remembered. For /tt twapi.
+--
+-- The row talks to a widget that has been renamed, re-parented and had its
+-- method list rearranged across builds, and every one of those calls is inside
+-- a pcall -- which is right for not dying and useless for finding out. This
+-- asks the questions out loud, once, on demand.
+function ns.AuraEngineProbe()
+    local t = { methods = {}, missing = {} }
+
+    if C_AddOns and C_AddOns.IsAddOnLoaded then
+        t.blizzAddon = C_AddOns.IsAddOnLoaded("Blizzard_AuraContainer")
+                       and true or false
+    end
+
+    local ok, f = pcall(CreateFrame, "AuraContainer", nil, UIParent,
+                        "CustomAuraContainerTemplate")
+    t.created = ok and type(f) == "table"
+    if not t.created then
+        t.err = tostring(f)
+        return t
+    end
+    pcall(f.Hide, f)
+
+    for i = 1, #CONTAINER_METHODS do
+        local name = CONTAINER_METHODS[i]
+        local into = (type(f[name]) == "function") and t.methods or t.missing
+        into[#into + 1] = name
+    end
+
+    t.sortEnum = rawget(_G, "AuraContainerSortMethod") ~= nil
+    t.dirEnum  = rawget(_G, "AuraContainerSortDirection") ~= nil
+    t.flowEnum = (AnchorUtil and AnchorUtil.FlowDirection) ~= nil
+    return t
+end
 
 -- Enum tables, with the values DBM falls back to when the globals are absent.
 local SORT = rawget(_G, "AuraContainerSortMethod")
@@ -141,8 +219,10 @@ function ui.NewAuraRow(parent)
     local r = setmetatable({
         parent   = parent,
         groupKey = "TankTools_" .. nextKey,
-        look     = { size = 22, max = 5, spacing = 3, grow = "RIGHT" },
+        look     = { size = 22, max = 5, spacing = 3, grow = "RIGHT",
+                     filter = "normal" },
         icons    = {},   -- fallback path only
+        buttons  = {},   -- engine path only, in the order it built them
     }, RowMT)
 
     -- A frame of our own, not the container, and not the block. The container
@@ -175,57 +255,136 @@ end
 
 -- Runs once per button the engine creates, and it is the only window in which
 -- the button may be decorated: post-creation writes are denied while auras are
--- secret, which is exactly the fight this row exists for. Everything is
--- pcall-guarded because an error in here aborts the engine's whole button
--- batch, taking the group with it.
+-- secret, which is exactly the fight this row exists for.
+--
+-- EVERY LINE IN HERE IS GUARDED, AND THAT IS NOT BELT AND BRACES
+--
+-- An error anywhere in initializeFrame propagates out of AddAuraGroup and
+-- takes the whole group with it -- the container is then thrown away, the row
+-- falls back to reading auras itself, and the fallback refuses to read while
+-- auras are restricted. So one denied SetPoint on one button turns into an
+-- empty row for the entire fight, which is precisely the failure this file
+-- was written to end.
+--
+-- That is not hypothetical on an AuraButton. The widget carries Forbidden
+-- Aspects -- UntrustedScriptExecution, UntrustedLayoutScriptExecution and
+-- friends -- so creating a region on one, anchoring to it, or parenting a
+-- frame to it can be refused outright, and which of those are refused has
+-- moved between builds. An earlier version of this function guarded only the
+-- three Set* registrations and left the CreateTexture, CreateFrame and
+-- SetPoint calls bare, which is exactly the wrong half.
+--
+-- The decorations are therefore independent and ordered by how much they
+-- matter. The icon is the row; losing it is losing everything. The border,
+-- the swipe and the stack count are each worth having and none is worth the
+-- group. What failed is recorded, never swallowed, because a button with no
+-- icon registered draws nothing and looks exactly like a tank with no debuffs.
 local function InitButton(row, button)
     local L = row.look
-    row.built = (row.built or 0) + 1
 
-    local icon = button:CreateTexture(nil, "ARTWORK")
-    icon:SetAllPoints(button)
-    -- Trim the stock border so the art sits flush inside our own edge, the
-    -- same crop the fallback icons use.
-    icon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
+    -- Kept because the engine tells us nothing about its own buttons
+    -- afterwards, and initializeFrame is the only time we are handed one.
+    -- Counting how many are *shown* is what separates "the group matched
+    -- nothing" from "the group matched and our layout put the icons somewhere
+    -- off screen" -- two failures that look identical from the chair.
+    row.buttons[#row.buttons + 1] = button
 
-    local edge = button:CreateTexture(nil, "BACKGROUND")
-    edge:SetPoint("TOPLEFT", -1, 1)
-    edge:SetPoint("BOTTOMRIGHT", 1, -1)
-    edge:SetColorTexture(0, 0, 0, 1)
+    -- Which setters this client's AuraButton actually has, recorded off the
+    -- first one. /tt twapi prints it, and it is the difference between knowing
+    -- what we are talking to and guessing at a method name.
+    if not row.buttonAPI then
+        local api = {}
+        for i = 1, #BUTTON_METHODS do
+            local name = BUTTON_METHODS[i]
+            if type(button[name]) == "function" then api[#api + 1] = name end
+        end
+        row.buttonAPI = api
+    end
 
-    local cd = CreateFrame("Cooldown", nil, button, "CooldownFrameTemplate")
-    cd:SetAllPoints(button)
-    cd:SetReverse(true)
-    cd:SetHideCountdownNumbers(true)
-    cd:SetDrawEdge(false)
-    cd:SetDrawBling(false)
-
-    -- The stack count is why this panel exists, so it sits above the cooldown
-    -- swipe in a thick outline rather than tucked into a corner at border size.
-    local overlay = CreateFrame("Frame", nil, button)
-    overlay:SetAllPoints(button)
-    overlay:SetFrameLevel(cd:GetFrameLevel() + 1)
-    overlay:EnableMouse(false)
-
-    local count = overlay:CreateFontString(nil, "OVERLAY")
-    count:SetPoint("BOTTOMRIGHT", button, "BOTTOMRIGHT", 2, -2)
-    count:SetFont(FONT, floor(L.size * 0.62), "THICKOUTLINE")
-
-    -- Regions are created and styled before they are registered: each Set*
-    -- makes the engine draw into them immediately, and a font string with no
-    -- font assigned errors inside the engine when it does.
-    -- Recorded, not swallowed. A button with no icon registered draws
-    -- nothing, which is indistinguishable from "no debuffs" -- and that is
-    -- precisely the failure this row was written to end.
-    local function Wire(what, fn, ...)
-        local ok, err = pcall(fn, ...)
-        if not ok then row.wireErr = what .. ": " .. tostring(err) end
+    local function Try(what, fn)
+        local ok, err = pcall(fn)
+        if not ok then
+            row.wireErr = (row.wireErr and (row.wireErr .. " | ") or "")
+                          .. what .. ": " .. tostring(err)
+        end
         return ok
     end
 
-    Wire("SetIcon", button.SetIcon, button, icon)
-    Wire("SetDurationCooldown", button.SetDurationCooldown, button, cd)
-    Wire("SetApplicationCount", button.SetApplicationCount, button, count, {})
+    -- SIZE FIRST, AND IT HAS TO BE US THAT DOES IT
+    --
+    -- Nothing in the engine gives an AuraButton a rect. CustomAuraButtonTemplate
+    -- carries mixins and an OnUpdate and no <Size>; the frame provider joins
+    -- that template with whatever templateNames the group asked for and sets
+    -- nothing itself; and the flow layout's ApplyElementLayout only clears the
+    -- points and sets one anchor -- it never sizes the element. The layout's
+    -- elementWidth/elementHeight decide the *spacing* it lays out with, not the
+    -- size of the frame it lays out.
+    --
+    -- So a button is 0x0 until an addon says otherwise, and an icon told to
+    -- SetAllPoints on a 0x0 button is a 0x0 icon. That is a row where the
+    -- engine reports a group, builds its buttons, positions them, shows them,
+    -- and puts nothing on screen -- which read from this side as "the filter
+    -- ate my debuffs" for a long time.
+    --
+    -- The engine owns the button afterwards, so this is the only chance.
+    Try("size", function() button:SetSize(L.size, L.size) end)
+
+    -- The icon, and the registration that makes the engine draw into it. Done
+    -- as one unit because either half alone is useless.
+    Try("icon", function()
+        local icon = button:CreateTexture(nil, "ARTWORK")
+        icon:SetAllPoints(button)
+        -- Trim the stock border so the art sits flush inside our own edge, the
+        -- same crop the fallback icons use.
+        icon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
+        button:SetIcon(icon)
+    end)
+
+    Try("edge", function()
+        local edge = button:CreateTexture(nil, "BACKGROUND")
+        edge:SetPoint("TOPLEFT", -1, 1)
+        edge:SetPoint("BOTTOMRIGHT", 1, -1)
+        edge:SetColorTexture(0, 0, 0, 1)
+    end)
+
+    -- The swipe. SetDurationCooldown is the name this widget has had longest;
+    -- where the client only offers SetDurationText we hand it a font string
+    -- instead, which is a worse timer but a timer.
+    local cdLevel
+    Try("duration", function()
+        if type(button.SetDurationCooldown) == "function" then
+            local cd = CreateFrame("Cooldown", nil, button, "CooldownFrameTemplate")
+            cd:SetAllPoints(button)
+            cd:SetReverse(true)
+            cd:SetHideCountdownNumbers(true)
+            cd:SetDrawEdge(false)
+            cd:SetDrawBling(false)
+            button:SetDurationCooldown(cd)
+            cdLevel = cd:GetFrameLevel()
+        elseif type(button.SetDurationText) == "function" then
+            local txt = button:CreateFontString(nil, "OVERLAY")
+            txt:SetPoint("TOP", button, "TOP", 0, -1)
+            txt:SetFont(FONT, floor(L.size * 0.5), "THICKOUTLINE")
+            button:SetDurationText(txt)
+        end
+    end)
+
+    -- The stack count is why this panel exists, so it sits above the cooldown
+    -- swipe in a thick outline rather than tucked into a corner at border size.
+    Try("count", function()
+        local overlay = CreateFrame("Frame", nil, button)
+        overlay:SetAllPoints(button)
+        overlay:SetFrameLevel((cdLevel or button:GetFrameLevel()) + 1)
+        overlay:EnableMouse(false)
+
+        local count = overlay:CreateFontString(nil, "OVERLAY")
+        count:SetPoint("BOTTOMRIGHT", button, "BOTTOMRIGHT", 2, -2)
+        -- Styled before it is registered: the Set* makes the engine draw into
+        -- it immediately, and a font string with no font assigned errors
+        -- inside the engine when it does.
+        count:SetFont(FONT, floor(L.size * 0.62), "THICKOUTLINE")
+        button:SetApplicationCount(count, {})
+    end)
 
     -- Engine buttons come click-enabled, and this row sits in the middle of
     -- the screen during a fight. Motion stays on when tooltips are wanted --
@@ -235,19 +394,43 @@ local function InitButton(row, button)
     pcall(button.SetMouseMotionEnabled, button, L.tooltips and true or false)
 end
 
+-- The candidate filters, and the debug ladder for taking them away.
+--
+-- Every one of these is write-only: the engine applies it and never reports
+-- what it dropped, so a filter that matches nothing looks exactly like a tank
+-- with no debuffs. That is not hypothetical -- it is the likeliest reason for
+-- an empty row on a client whose engine is otherwise working, and there is no
+-- way to see it from the outside.
+--
+-- So the row can be asked to drop them, one rung at a time:
+--
+--   normal  what the settings say
+--   loose   the exclusion list only -- nothing about who applied the aura
+--   none    no filters at all, everything harmful the engine will hand over
+--
+-- If icons appear on "loose" or "none", a filter was eating them and we know
+-- which. /tt twfilter walks the ladder; it is session-only and deliberately
+-- not a setting, because it is a question rather than a preference.
+local function CandidateFilters(L)
+    if L.filter == "none" then return {} end
+
+    local f = { excludeSpellIDs = NEVER_SHOW }
+    if L.filter == "loose" then return f end
+
+    -- `isBossOrRoleAura` is what keeps a five-icon row from filling with procs
+    -- and leaving the tank debuff off the end, now that we cannot sort it to
+    -- the front ourselves.
+    if L.bossOnly then
+        f.isBossOrRoleAura = true
+    else
+        f.isFromPlayerOrPlayerPet = false
+    end
+    return f
+end
+
 local function GroupOptions(row)
     local L = row.look
-
-    -- Write-only: the engine applies these and never reports what they
-    -- matched. `isBossOrRoleAura` is the one that matters -- it is what keeps
-    -- a five-icon row from filling with procs and leaving the tank debuff off
-    -- the end, now that we cannot sort it to the front ourselves.
-    local candidateFilters = { excludeSpellIDs = NEVER_SHOW }
-    if L.bossOnly then
-        candidateFilters.isBossOrRoleAura = true
-    else
-        candidateFilters.isFromPlayerOrPlayerPet = false
-    end
+    local candidateFilters = CandidateFilters(L)
 
     return {
         maxFrameCount = L.max,
@@ -485,7 +668,11 @@ local function DrawFallback(row)
         return
     end
 
-    local n = ReadAuras(unit, L.bossOnly)
+    -- Through the same ladder the engine path uses. Without this the
+    -- fallback would keep applying bossOnly on a client where the setting
+    -- that turns it off cannot reach it -- the two paths have to agree about
+    -- what they were asked for, or "show every debuff" means two things.
+    local n = ReadAuras(unit, L.filter == "normal" and L.bossOnly)
     local shown = (n < L.max) and n or L.max
     row.shown = shown
 
@@ -541,7 +728,8 @@ end
 -- `look` is copied, not kept: the caller's settings table is live, and a row
 -- that read it later would re-lay itself out mid-fight when a slider moved.
 --
--- Fields: size, max, spacing, grow ("LEFT"|"RIGHT"), tooltips, bossOnly.
+-- Fields: size, max, spacing, grow ("LEFT"|"RIGHT"), tooltips, bossOnly,
+-- filter ("normal"|"loose"|"none").
 function Row:Configure(look)
     local L = self.look
     L.size     = look.size or L.size
@@ -550,6 +738,7 @@ function Row:Configure(look)
     L.grow     = (look.grow == "LEFT") and "LEFT" or "RIGHT"
     L.tooltips = look.tooltips and true or false
     L.bossOnly = look.bossOnly and true or false
+    L.filter   = FILTER_MODES[look.filter] and look.filter or "normal"
 
     self.host:SetSize(self:Width(), L.size)
 
@@ -569,9 +758,11 @@ function Row:Configure(look)
         pcall(c.SetAuraGroupLayout, c, self.groupKey, o.layout)
         pcall(c.SetAuraGroupSortMethod, c, self.groupKey,
               o.sortMethod, o.sortDirection)
-        -- Buttons already built keep the font size they were initialised with;
-        -- the engine owns their geometry, so the only visible drift after a
-        -- size change is the stack text, and it corrects on the next reload.
+        -- Buttons already built keep the size and font they were initialised
+        -- with -- the engine owns them once initializeFrame has returned, so
+        -- the icon-size slider only fully takes effect on the next reload.
+        -- The layout it lays them out with does update, so the row stays
+        -- evenly spaced in the meantime.
     else
         ApplyFallbackLayout(self)
     end
@@ -626,6 +817,63 @@ function Row:Count()
     return self.shown
 end
 
+-- What our candidate filters would do with one aura, in words.
+--
+-- A diagnostic, and never a path the row itself takes: it has to read the
+-- aura, which is the thing the client refuses in exactly the content that
+-- matters. Where it can run -- a delve, a dungeon before the pull, anywhere
+-- enumeration is still allowed -- it answers the one question the engine will
+-- not, which is why an icon is missing.
+function Row:Verdict(a)
+    local L = self.look
+
+    if L.filter == "none" then return "|cff00ff00kept|r -- no filters at all" end
+
+    local id = Clean(a.spellId)
+    if type(id) == "number" and NEVER_SHOW[id] then
+        return "|cffff4040dropped|r -- on the never-show list"
+    end
+    if L.filter == "loose" then
+        return "|cff00ff00kept|r -- only the never-show list applies"
+    end
+
+    if L.bossOnly then
+        -- We ask the engine for isBossOrRoleAura, which is one flag covering
+        -- two facts, and the aura table carries them separately. Both are
+        -- checked so this verdict cannot claim a drop the engine would not
+        -- make.
+        local boss = Clean(a.isBossAura)
+        local role = Clean(a.isTankRoleAura)
+        if boss == true or role == true then
+            return "|cff00ff00kept|r -- a boss or tank-role aura"
+        end
+        if boss == false and role == false then
+            return "|cffff4040dropped|r -- neither a boss nor a role aura, and "
+                   .. "\"boss and role debuffs only\" is on"
+        end
+        return "|cffff8000unknown|r -- the boss and role flags are not readable "
+               .. "here"
+    end
+
+    -- The default path. We ask the engine for auras whose
+    -- isFromPlayerOrPlayerPet is false, which is a documented and supported
+    -- negation -- so a debuff a mob put on you should pass. If one is dropped
+    -- here anyway, the filter is not behaving as documented and /tt twfilter
+    -- loose will show it.
+    local fp = a.isFromPlayerOrPlayerPet
+    if fp == nil then
+        return "|cffff8000unknown|r -- this aura has no isFromPlayerOrPlayerPet "
+               .. "field at all, and we filter on it"
+    end
+    if IsSecret(fp) then
+        return "|cffff8000unknown|r -- isFromPlayerOrPlayerPet came back secret"
+    end
+    if fp == true then
+        return "|cffff4040dropped|r -- you or your pet applied it"
+    end
+    return "|cff00ff00kept|r"
+end
+
 -- Everything the row knows about its own state, for /tt cotanks.
 --
 -- This exists because "no debuffs appeared" has at least five distinct causes
@@ -641,21 +889,63 @@ function Row:Report()
         err      = self.err,
         wireErr  = self.wireErr,
         bossOnly = L.bossOnly,
+        filter   = L.filter,
         max      = L.max,
         size     = L.size,
         width    = self:Width(),
         hostShown = self.host:IsShown(),
     }
 
+    t.buttonAPI = self.buttonAPI
+
     local c = self.container
     if c then
         t.container = true
-        t.built     = self.built or 0
+        t.built     = #self.buttons
+        t.filters   = CandidateFilters(L)
         local okHas, has = pcall(c.HasAuraGroup, c, self.groupKey)
         t.group     = okHas and has or false
-        t.shown     = c:IsShown()
-        local w, h  = c:GetWidth(), c:GetHeight()
-        t.rect      = (w or 0) .. "x" .. (h or 0)
+
+        -- LAUNDERED, INCLUDING THE GEOMETRY, AND THAT IS THE WHOLE LESSON
+        --
+        -- The engine's container and its buttons are restricted widgets, so
+        -- everything you can ask them about themselves comes back secret --
+        -- IsShown(), GetWidth(), GetHeight(), all of it. `if b:IsShown()` on
+        -- an engine button throws, and it threw here: a diagnostic written to
+        -- explain a blank row instead errored inside the command meant to
+        -- explain it.
+        --
+        -- Which is the same rule the health bar has followed since the start,
+        -- applied to a place nobody thought to look: a frame we created is
+        -- ours to read, a frame the client handed us is not, and a getter is
+        -- as restricted as any Unit* call.
+        t.shown = Show(c:IsShown())
+        t.rect  = Show(c:GetWidth()) .. " x " .. Show(c:GetHeight())
+
+        -- Three outcomes per button, and collapsing the last two would be a
+        -- lie: shown, not shown, and "the client will not say". Counting an
+        -- unreadable button as hidden would report "the engine is showing
+        -- nothing" in exactly the content where it is showing everything.
+        local vis, unsure = 0, 0
+        for i = 1, #self.buttons do
+            local sh = self.buttons[i]:IsShown()
+            if IsSecret(sh) then
+                unsure = unsure + 1
+            elseif sh then
+                vis = vis + 1
+            end
+        end
+        t.visible   = vis
+        t.visSecret = unsure
+
+        -- Unconditionally, and not just for a button we can prove is showing:
+        -- a zero-sized button is invisible whether or not it is shown, and
+        -- that was the actual bug. Reporting it only for visible buttons hid
+        -- the number behind the very secrecy that made the row hard to debug.
+        local b1 = self.buttons[1]
+        if b1 then
+            t.firstRect = Show(b1:GetWidth()) .. " x " .. Show(b1:GetHeight())
+        end
     end
 
     return t

@@ -12,6 +12,11 @@ ADDON_PATH = ADDON_DIR
 local allFrames  = {}
 local allRegions = {}
 
+-- Declared up here rather than beside WORLD because the aura widgets below
+-- hand it back from their own getters, and an upvalue has to exist before the
+-- function that closes over it.
+local SECRET = setmetatable({}, { __tostring = function() return "secret" end })
+
 local function NewRegion(kind, parent)
     local r = {
         _type = kind, _text = "", _shown = true, _alpha = 1,
@@ -126,8 +131,37 @@ end
 -- what "the client draws it, the addon does not read it" means.
 --------------------------------------------------------------------------------
 
+-- A widget the client owns answers its own getters with secrets while auras
+-- are secret -- IsShown, GetWidth and GetHeight included. That is not a detail:
+-- `if button:IsShown() then` throws, and an addon that reads its own frames the
+-- same way it reads the client's will error inside the very diagnostic written
+-- to explain why nothing is on screen. Modelled here so the suite fails the
+-- way the client does.
+local function Restrict(r)
+    local isShown, getW, getH = r.IsShown, r.GetWidth, r.GetHeight
+    -- The suite needs ground truth about what is on screen, which the addon
+    -- itself is not allowed to have. Kept off the widget's public surface so a
+    -- test cannot accidentally assert through a door the addon lacks.
+    r._RawShown = isShown
+    r._RawWidth = getW
+    r._RawHeight = getH
+    function r:IsShown()
+        if WORLD.aurasSecret then return SECRET end
+        return isShown(self)
+    end
+    function r:GetWidth()
+        if WORLD.aurasSecret then return SECRET end
+        return getW(self)
+    end
+    function r:GetHeight()
+        if WORLD.aurasSecret then return SECRET end
+        return getH(self)
+    end
+    return r
+end
+
 local function NewAuraContainer(parent)
-    local c = NewRegion("AuraContainer", parent)
+    local c = Restrict(NewRegion("AuraContainer", parent))
     c._groups, c._order = {}, {}
 
     function c:AddAuraGroup(key, filter, opts)
@@ -162,7 +196,7 @@ local function NewAuraContainer(parent)
     local function Button(group, i)
         local b = group.buttons[i]
         if b then return b end
-        b = NewRegion("AuraButton")
+        b = Restrict(NewRegion("AuraButton"))
         function b:SetIcon(t) self._icon = t end
         function b:SetDurationCooldown(cd) self._cd = cd end
         function b:SetApplicationCount(fs) self._count = fs end
@@ -329,8 +363,6 @@ WORLD = {
     units        = {},      -- token -> { exists, isPlayer, dead, combat, threat = {by unit} }
 }
 
-local SECRET = setmetatable({}, { __tostring = function() return "secret" end })
-
 function issecretvalue(v) return v == SECRET end
 
 local function U(token) return WORLD.units[token] end
@@ -458,6 +490,12 @@ C_UnitAuras = {
             -- tooltip setter, which takes a secret as happily as a number.
             auraInstanceID = a.auraInstanceID,
             isBossAura     = a.boss,
+            -- Both are documented as always present on AuraData, and
+            -- isFromPlayerOrPlayerPet is explicitly never secret. The row
+            -- filters on it, so a stub that left it off would have the addon
+            -- reading nil where the client always answers a boolean.
+            isTankRoleAura = a.tankRole and true or false,
+            isFromPlayerOrPlayerPet = a.fromPlayer and true or false,
         }
         if WORLD.secretMode then
             -- Identity-ish fields go secret; the icon stays usable because a

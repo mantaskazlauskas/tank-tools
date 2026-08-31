@@ -83,19 +83,56 @@ end
 -- Multi-line notes are laid out by a caller that only knows its own newlines,
 -- so hand back a Y that has actually cleared the text -- which is what lets
 -- the panel size itself to its content instead of to a remembered number.
-function ui.Note(parent, x, y, text)
+-- A scratch string kept off screen, purely to measure with. It never has a
+-- width set, so it never wraps, which is what makes it a ruler.
+local measure
+
+-- How many lines `text` will occupy once the column has wrapped it.
+--
+-- Counting the newlines we wrote is not the same question, and treating it as
+-- though it were is what let notes run off the side of the panel: a hand-
+-- wrapped line that turns out to be too wide becomes two on screen and one in
+-- the arithmetic, and everything below it is laid out on top.
+local function WrappedLines(text, size, width)
+    if not measure then
+        measure = UIParent:CreateFontString(nil, "OVERLAY")
+    end
+    measure:SetFont(ui.FontPath(), size, "")
+
+    local lines = 0
+    -- The trailing newline makes the last segment match like any other, and
+    -- the pattern keeps empty segments so a blank line still costs a line.
+    for segment in string.gmatch(text .. "\n", "([^\n]*)\n") do
+        measure:SetText(segment)
+        local w = measure:GetStringWidth() or 0
+        local n = (w > width) and math.ceil(w / width) or 1
+        lines = lines + n
+    end
+    return lines
+end
+
+-- `width` defaults to the full column. Pass a narrower one when the note is
+-- indented, or it runs past the column by exactly the indent.
+function ui.Note(parent, x, y, text, width)
+    width = width or ui.COL_W
+
     local fs = ui.Label(parent, text, 11, 0.6, 0.6, 0.6)
     fs:SetPoint("TOPLEFT", x, y)
     fs:SetJustifyH("LEFT")
 
+    -- Bounded to the column, like every other widget in this file. This one
+    -- was the exception -- no width, so the string was free to run past the
+    -- column and, in the right-hand one, past the edge of the frame itself.
+    -- The newlines in a note are now a suggestion about where lines look best
+    -- rather than the only thing stopping the text escaping.
+    fs:SetWidth(width)
+    fs:SetWordWrap(true)
+
     -- GetStringHeight is measured, not laid out, so it is available
     -- immediately -- but a zero from it would silently collapse the panel onto
-    -- its own last note. The line count is the floor, and the string never
-    -- wraps because no width is set: every break in it is one we wrote.
+    -- its own last note. The measured line count is the floor.
     local h = fs:GetStringHeight() or 0
-    local lines = 1
-    for _ in string.gmatch(text, "\n") do lines = lines + 1 end
-    local floorH = lines * 13
+    local floorH = WrappedLines(text, 11, width) * 13
     if h < floorH then h = floorH end
 
     return y - h - 8

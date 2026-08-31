@@ -77,14 +77,12 @@ section("load")
 
 BuildRaid()
 
--- The panel is still behind a feature flag, so out of the box its module never
--- starts. Seeded here as an existing saved-variables table with the flag set,
--- which is exactly the state of someone who has switched it on in /tt features
--- and reloaded -- the only state in which any of this suite is reachable.
-TankToolsDB = { dbVersion = 2, modules = { features = { cotanks = true } } }
-
 FireEvent("ADDON_LOADED", "TankTools")
-ok(NS.FeatureEnabled("cotanks"), "the co-tank feature flag is on for this suite")
+
+-- Shipped, so there is nothing to switch on: the module starts for everybody.
+-- This suite used to seed a saved-variables table with the flag set, which was
+-- the only state in which any of it was reachable.
+eq(NS.GetFeature("cotanks"), nil, "the co-tank panel ships without a flag")
 -- By name, not by count: a suite that has to be edited every time a module is
 -- added is the coupling the module registry exists to remove.
 ok(NS.GetModule("tankwatch") ~= nil, "tankwatch module registered")
@@ -232,13 +230,15 @@ section("debuffs")
 
 -- raid2 is block 2 and carries four harmful auras, one of them stacking to 7.
 -- Shown buttons the aura engine created for a row, in the order it drew them.
+-- Through _RawShown, not IsShown: a restricted widget answers its own getters
+-- with secrets, so the addon cannot count these and neither could this helper.
 local function EngineButtons(row)
     local out = {}
     local c = row.container
     if not c then return out end
     for _, key in ipairs(c._order) do
         for _, b in ipairs(c._groups[key].buttons) do
-            if b:IsShown() then out[#out + 1] = b end
+            if b:_RawShown() then out[#out + 1] = b end
         end
     end
     return out
@@ -261,6 +261,19 @@ if ENGINE then
 
     local buttons = EngineButtons(row)
     eq(#buttons, 4, "four debuffs drawn while aura reads are denied")
+
+    -- Nothing in the engine gives an AuraButton a rect. The template carries
+    -- no size, the frame provider sets none, and the flow layout's
+    -- ApplyElementLayout only clears the points and sets one anchor -- its
+    -- elementWidth/elementHeight decide spacing, not the frame. So a button is
+    -- 0x0 until we say otherwise, an icon told to SetAllPoints on it is 0x0
+    -- too, and the row reports a group, buttons, positions and shows -- and
+    -- puts nothing on screen. It read as "the filter ate my debuffs" for a
+    -- long time.
+    eq(buttons[1]:_RawWidth(), NS.GetModule("tankwatch").db.twIconSize,
+       "engine buttons are sized by us, or they are invisible")
+    eq(buttons[1]:_RawHeight(), NS.GetModule("tankwatch").db.twIconSize,
+       "in both directions")
     eq(buttons[2]._icon._texture, "icon-b", "the engine drew the icon art")
     eq(buttons[2]._count._text, 7, "and the stack count that decides the swap")
     ok(buttons[2]._click == false, "buttons do not eat clicks meant for the world")
@@ -652,8 +665,8 @@ eq(db.twEnabled, false, "/tt tw toggles the panel off")
 Slash("tw")
 eq(db.twEnabled, true, "and back on")
 
--- The other half of the gate: with the flag set, the commands are listed
--- again. suite_core asserts they vanish when it is not.
+-- Listed in the help like any other shipped command. suite_core asserts the
+-- gate itself, against a module that is still behind one.
 local nh = #CHAT
 Slash("")
 local helpText = ""
@@ -714,12 +727,13 @@ ok(joined:find("co%-tank panel:") ~= nil, "status carries the module's line")
 ok(joined:find("tank spec:") ~= nil, "and still carries the threat module's")
 
 --------------------------------------------------------------------------------
-section("solo in a dungeon")
+section("solo inside an instance")
 --
 -- The panel exists for the tank swap, so out of the box it needs two tanks and
 -- a five-man never has them. But your own bar goes through the same reads and
--- the same setters a co-tank's does in a raid, so a dungeon is where those can
--- be checked cheaply -- which is the whole point of the opt-in.
+-- the same setters a co-tank's does in a raid, and the client restricts by
+-- instance rather than by group size -- so any instance you can walk into
+-- alone exercises the raid path, which is the whole point of the opt-in.
 --------------------------------------------------------------------------------
 
 -- Drop out of the raid and into a five-man where we are the only tank.
@@ -742,9 +756,15 @@ FireEvent("GROUP_ROSTER_UPDATE")
 eq(NS.state.instanceType, "party", "Core cached the instance type")
 eq(#NS.tankUnits, 1, "we are the only tank in the dungeon")
 
+-- Pinned, because it is a default that was deliberately flipped: being the
+-- only tank in a delve or a five-man is the ordinary case, and a panel hidden
+-- through all of it until you find a checkbox reads as a broken panel.
+eq(NS.GetModule("tankwatch").defaults.twSoloDungeon, true,
+   "showing solo inside an instance is on out of the box")
+
 db.twEnabled, db.twMinTanks, db.twSoloDungeon = true, 2, false
 Tick(0.25)
-ok(not panel:IsShown(), "off by default: one tank is still below the minimum")
+ok(not panel:IsShown(), "turned off, one tank is below the minimum again")
 
 db.twSoloDungeon = true
 Tick(0.25)
@@ -776,11 +796,28 @@ Tick(0.25)
 eq(NS.state.instanceType, "none", "instance type follows us out")
 ok(not panel:IsShown(), "not in the open world")
 
--- Nor in a battleground, which is an instance but not a dungeon.
+-- Nor in a battleground, where a panel of yourself is only ever in the way.
 WORLD.inInstance, WORLD.instanceType = true, "pvp"
 FireEvent("PLAYER_ENTERING_WORLD")
 Tick(0.25)
 ok(not panel:IsShown(), "not in a battleground either")
+
+-- A delve, which is the case the opt-in was widened for: instanced, entered
+-- alone, and reported by the client as a scenario. If this stops showing, the
+-- only place left to prove the debuff path is a raid night.
+WORLD.inInstance, WORLD.instanceType = true, "scenario"
+FireEvent("PLAYER_ENTERING_WORLD")
+Tick(0.25)
+eq(NS.state.instanceType, "scenario", "a delve reports as a scenario")
+ok(panel:IsShown(), "the panel shows solo in a delve")
+eq(IconsShown(blocks[1]), 2, "and draws our own debuffs there")
+
+-- And in a raid instance walked into alone, for the same reason: it is the
+-- content the panel is ultimately for, and one tank in it is still worth a bar.
+WORLD.inInstance, WORLD.instanceType = true, "raid"
+FireEvent("PLAYER_ENTERING_WORLD")
+Tick(0.25)
+ok(panel:IsShown(), "and solo inside a raid instance")
 
 -- An instance type the client invents later must read as "not a dungeon"
 -- rather than crash a comparison or slip through.
@@ -789,6 +826,17 @@ FireEvent("PLAYER_ENTERING_WORLD")
 Tick(0.25)
 eq(NS.state.instanceType, "none", "an unknown instance type falls back")
 ok(not panel:IsShown(), "and does not turn the panel on")
+
+-- ...but what the client actually said is kept, because that fallback is the
+-- one failure of the solo gate that looks exactly like nothing being wrong.
+-- /tt cotanks prints it, so a content type we have not listed is one line away
+-- from being diagnosed instead of a mystery.
+eq(NS.state.instanceTypeRaw, "somethingnew", "the raw type is remembered")
+local nRaw = #CHAT
+Slash("cotanks")
+local rawDump = ""
+for _, l in ipairs(ChatSince(nRaw)) do rawDump = rawDump .. Strip(l) .. " " end
+ok(rawDump:find("somethingnew") ~= nil, "and the dump says so")
 
 -- Back to the raid the rest of the suite was built on.
 db.twSoloDungeon = false
@@ -814,6 +862,298 @@ eq(NS.GetTicker("threat").disabled, false, "the threat scan is untouched")
 t.fn = real
 FireEvent("PLAYER_ENTERING_WORLD")
 eq(t.disabled, false, "a zone change clears it")
+
+--------------------------------------------------------------------------------
+section("the filter ladder")
+--
+-- A candidate filter that matches nothing is indistinguishable from a tank
+-- with no debuffs: the engine applies it and never says what it dropped. That
+-- is the one failure the panel cannot show you, so /tt twfilter takes the
+-- filters away a rung at a time until the icons come back.
+--------------------------------------------------------------------------------
+
+Tick(0.25)
+local frow = blocks[1].auras
+eq(frow:Report().filter, "normal", "the row filters normally out of the box")
+
+Slash("twfilter")
+Tick(0.25)
+eq(frow:Report().filter, "loose", "one step drops the who-applied-it filter")
+
+Slash("twfilter")
+Tick(0.25)
+eq(frow:Report().filter, "none", "the next drops everything")
+
+Slash("twfilter")
+Tick(0.25)
+eq(frow:Report().filter, "normal", "and it wraps back round")
+
+-- Hidden from the help: it is an instrument, and listing it would put a
+-- debugging switch in front of everyone who typed /tt.
+local nf = #CHAT
+Slash("")
+local fhelp = ""
+for _, l in ipairs(ChatSince(nf)) do fhelp = fhelp .. Strip(l) .. " " end
+ok(fhelp:find("twfilter") == nil, "but it is not in the help")
+
+if ENGINE then
+    -- Buttons built with none of them showing is the signature of a filter
+    -- that matched nothing, and it is the number the dump leads with.
+    local frow2 = blocks[2].auras
+    local funit = frow2.unit
+    WORLD.units[funit].auras = {
+        Aura("boss-debuff", 3, 30, 20, true),
+        Aura("some-proc",  nil, 10,  8, false),
+    }
+    FireEvent("UNIT_AURA", funit)
+    Tick(0.25)
+
+    eq(#EngineButtons(frow2), 2, "the engine draws both")
+
+    -- ...and the row cannot say so. Every getter on an engine button is
+    -- secret in here, so "how many are showing" has three answers and the
+    -- honest one is "the client will not say". Reporting those as hidden
+    -- would print "showing none" in the one place the engine is working
+    -- perfectly, which is worse than admitting the gap.
+    local r = frow2:Report()
+    eq(r.built, #frow2.buttons, "the report counts the buttons it was handed")
+    eq(r.visible, 0, "and claims none as readable-shown")
+    eq(r.visSecret, r.built, "because every one of them is unreadable")
+
+    -- Turning a filter on still changes what the engine draws, which the
+    -- suite can see even though the addon cannot.
+    NS.GetModule("tankwatch").db.twBossAuras = true
+    NS.TankWatchLooksChanged()
+    Tick(0.25)
+    eq(#EngineButtons(frow2), 1, "the boss filter drops the proc")
+    ok(frow2:Report().built >= r.built, "while the buttons it built stay built")
+
+    NS.GetModule("tankwatch").db.twBossAuras = false
+    NS.TankWatchLooksChanged()
+    Tick(0.25)
+end
+
+--------------------------------------------------------------------------------
+section("the zone the client has not admitted to yet")
+--
+-- The reported bug, and it is a caching one. At the first PLAYER_ENTERING_WORLD
+-- after a transition the client will still describe the zone you just left.
+-- The instance type was read once on that event and never again, so the panel
+-- spent the whole delve believing it was outdoors -- and the whole trip home
+-- believing it was still in the delve. /reload fixed both, which is what said
+-- the reads were fine and the cached answer was old.
+--------------------------------------------------------------------------------
+
+WORLD.inRaid, WORLD.groupSize = false, 0
+WORLD.raidIndex = nil
+WORLD.specRole = "TANK"
+WORLD.units["player"] = {
+    name = "Tankadin", isPlayer = true, class = "WARRIOR",
+    hp = 80, hpMax = 100,
+    auras = { Aura("delve-debuff", 2, 20, 15, false) },
+}
+for i = 1, 4 do WORLD.units["party" .. i] = nil end
+WORLD.inInstance, WORLD.instanceType = false, "none"
+FireEvent("PLAYER_ENTERING_WORLD")
+FireEvent("GROUP_ROSTER_UPDATE")
+
+local zdb = NS.GetModule("tankwatch").db
+zdb.twEnabled, zdb.twMinTanks, zdb.twSoloDungeon = true, 2, true
+Tick(0.25)
+ok(not panel:IsShown(), "outdoors and alone, the panel is away")
+
+-- Enter the delve. The zone change fires while the client still reports the
+-- old zone, which is the case the one-shot read could not survive.
+FireEvent("PLAYER_ENTERING_WORLD")
+Tick(0.25)
+eq(NS.state.instanceType, "none", "the client is still describing the old zone")
+ok(not panel:IsShown(), "so nothing has changed yet, correctly")
+
+-- The client catches up a moment later, and says so to nobody.
+WORLD.inInstance, WORLD.instanceType = true, "scenario"
+Tick(0.5)
+eq(NS.state.instanceType, "scenario", "the cached answer is re-checked")
+-- The panel redraws on its own ticker, which may already have run this frame.
+Tick(0.25)
+ok(panel:IsShown(), "and the panel appears without a reload")
+eq(IconsShown(blocks[1]), 1, "drawing our own debuffs, which is the point")
+
+-- Leaving, the same way round: the client keeps saying "delve" for a moment.
+FireEvent("PLAYER_ENTERING_WORLD")
+Tick(0.25)
+ok(panel:IsShown(), "still shown while the client still says delve")
+
+WORLD.inInstance, WORLD.instanceType = false, "none"
+Tick(0.5)
+eq(NS.state.instanceType, "none", "and the change is noticed on its own")
+Tick(0.25)
+ok(not panel:IsShown(), "so the panel goes away without a reload")
+
+-- The other thing a loading screen is not ready for. Solo there is no roster
+-- event coming later to correct a role that read as nil, so an unlucky moment
+-- would leave the tank list empty for the whole visit.
+WORLD.inInstance, WORLD.instanceType = true, "scenario"
+WORLD.specRole = "NONE"
+FireEvent("PLAYER_ENTERING_WORLD")
+Tick(0.25)
+eq(NS.state.isTankRole, false, "the spec read as something other than tank")
+ok(not panel:IsShown(), "so there is no tank to draw")
+
+WORLD.specRole = "TANK"      -- the API catches up; nothing announces it
+Tick(0.5)
+eq(NS.state.isTankRole, true, "the settle window asks again")
+Tick(0.25)
+ok(panel:IsShown(), "and the panel appears, still without a reload")
+
+-- Back to the raid the rest of the suite was built on.
+WORLD.inInstance, WORLD.instanceType = false, "none"
+zdb.twSoloDungeon = false
+BuildRaid()
+FireEvent("PLAYER_ENTERING_WORLD")
+FireEvent("GROUP_ROSTER_UPDATE")
+Tick(0.25)
+eq(#NS.tankUnits, 3, "the raid roster is back")
+
+--------------------------------------------------------------------------------
+section("show every debuff")
+--
+-- The saved counterpart to the filter ladder. "Boss and role debuffs only"
+-- empties the row everywhere except a boss encounter -- a delve, a trash pull,
+-- anywhere the flags are not set -- and that is not obvious from the label, so
+-- there has to be a setting that says "no, show me them" and outranks it.
+--------------------------------------------------------------------------------
+
+local arow = blocks[2].auras
+local aunit = arow.unit
+WORLD.units[aunit].auras = {
+    Aura("a-boss-debuff", 4, 30, 20, true),
+    Aura("a-trash-debuff", nil, 12, 9, false),
+}
+FireEvent("UNIT_AURA", aunit)
+Tick(0.25)
+
+local adb = NS.GetModule("tankwatch").db
+eq(adb.twAllAuras, false, "off out of the box")
+
+adb.twBossAuras = true
+NS.TankWatchLooksChanged()
+Tick(0.25)
+eq(IconsShown(blocks[2]), 1, "the boss filter alone leaves one of the two")
+
+adb.twAllAuras = true
+NS.TankWatchLooksChanged()
+Tick(0.25)
+eq(arow:Report().filter, "loose", "showing everything is the loose rung")
+eq(IconsShown(blocks[2]), 2, "and the trash debuff comes back")
+
+-- Overriding rather than being overridden. A setting called "show every
+-- debuff" that another checkbox can quietly veto is worse than no setting.
+eq(adb.twBossAuras, true, "with the boss filter still switched on underneath")
+
+Slash("twall")
+Tick(0.25)
+eq(adb.twAllAuras, false, "/tt twall toggles it off")
+eq(IconsShown(blocks[2]), 1, "and the boss filter takes over again")
+Slash("twall")
+Tick(0.25)
+eq(IconsShown(blocks[2]), 2, "and back on")
+
+-- The session-only override still wins over the saved setting: someone who
+-- has just typed /tt twfilter is asking a question now, and should not have to
+-- work out which checkbox is arguing with them.
+Slash("twfilter")   -- normal -> loose
+Slash("twfilter")   -- loose  -> none
+Tick(0.25)
+eq(arow:Report().filter, "none", "twfilter outranks the setting while it is set")
+Slash("twfilter")   -- none   -> normal
+Tick(0.25)
+eq(arow:Report().filter, "loose",
+   "and hands back to the setting when it returns to normal")
+
+-- A real setting, so unlike the instruments it is in the help.
+local nall = #CHAT
+Slash("")
+local allHelp = ""
+for _, l in ipairs(ChatSince(nall)) do allHelp = allHelp .. Strip(l) .. " " end
+ok(allHelp:find("/tt twall") ~= nil, "and it is listed, being a setting")
+
+adb.twAllAuras, adb.twBossAuras = false, false
+NS.TankWatchLooksChanged()
+Tick(0.25)
+
+--------------------------------------------------------------------------------
+section("the instruments")
+--
+-- Two questions the panel cannot answer by looking at itself: what is actually
+-- on the unit, and what this client's aura widget offers. Both are commands
+-- rather than lines in the main dump, because they are long and only ever
+-- wanted once something is already wrong.
+--------------------------------------------------------------------------------
+
+local function Said(cmd)
+    local n = #CHAT
+    Slash(cmd)
+    local out = ""
+    for _, l in ipairs(ChatSince(n)) do out = out .. Strip(l) .. " " end
+    return out
+end
+
+local auraDump = Said("twauras")
+ok(auraDump:find("harmful auras") ~= nil, "/tt twauras dumps the auras")
+
+if ENGINE then
+    -- Enumeration is refused in this scenario, and saying so *is* the answer:
+    -- it means nothing but the engine can see these auras, so no field in the
+    -- list below could have been checked from here anyway.
+    ok(auraDump:find("refused the read") ~= nil,
+       "and says plainly when the client will not enumerate")
+else
+    ok(auraDump:find("fromPlayerOrPet") ~= nil,
+       "and names the fields our filters actually look at")
+    ok(auraDump:find("kept") ~= nil or auraDump:find("dropped") ~= nil,
+       "with a verdict per aura")
+end
+
+local apiDump = Said("twapi")
+ok(apiDump:find("aura engine") ~= nil, "/tt twapi describes the widget")
+if ENGINE then
+    ok(apiDump:find("AddAuraGroup") ~= nil, "listing the container methods")
+    ok(apiDump:find("AuraButton setters") ~= nil,
+       "and the button setters this client offers")
+else
+    ok(apiDump:find("failed") ~= nil,
+       "and says the container could not be created at all")
+end
+
+-- Neither is in the help. They are instruments, and listing them would put a
+-- wall of debugging in front of everyone who typed /tt.
+local ihelp = Said("")
+ok(ihelp:find("twauras") == nil, "twauras stays out of the help")
+ok(ihelp:find("twapi") == nil, "and so does twapi")
+
+--------------------------------------------------------------------------------
+section("the engine probe is retried")
+--
+-- Latching "no aura engine" for the session was the wrong half of the cache to
+-- keep. The fallback refuses to draw while auras are restricted, so a single
+-- unlucky probe -- Blizzard_AuraContainer not loaded yet, a CreateFrame that
+-- failed once -- left every row blank in exactly the content the panel exists
+-- for, with nothing on screen saying why.
+--------------------------------------------------------------------------------
+
+if not ENGINE then
+    eq(NS.HaveAuraEngine(), false, "the client had no engine when first asked")
+    ok(not blocks[1].auras:IsEngine(), "so the row was drawing for itself")
+
+    -- The engine turns up late. Nothing else changes.
+    WORLD.auraEngine = true
+    Tick(6)                       -- past PROBE_RETRY
+    eq(NS.HaveAuraEngine(), true, "asking again finds it")
+
+    NS.TankWatchLooksChanged()
+    Tick(0.25)
+    ok(blocks[1].auras:IsEngine(), "and the row moves onto it without a reload")
+end
 
 WORLD.secretMode = false
 report()

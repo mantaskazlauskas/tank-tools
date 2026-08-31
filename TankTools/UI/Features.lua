@@ -92,7 +92,9 @@ local function BuildContents(f)
         if feat.desc then
             -- Indented under its checkbox, so a feature reads as one block
             -- however many lines its note runs to.
-            y = ui.Note(f, x + 24, y + 4, feat.desc)
+            -- Indented under its checkbox, so the note has 24 fewer pixels
+            -- to live in than the column does.
+            y = ui.Note(f, x + 24, y + 4, feat.desc, ui.COL_W - 24)
         end
         y = y - 4
     end

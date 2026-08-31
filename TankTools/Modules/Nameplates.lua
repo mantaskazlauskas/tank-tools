@@ -37,6 +37,9 @@ local _, ns = ...
 
 local C_NamePlate      = C_NamePlate
 local UnitCanAttack    = UnitCanAttack
+local UnitExists       = UnitExists
+local GetTime          = GetTime
+local twipe            = wipe
 local issecretvalue    = issecretvalue
 local strmatch, tonumber = string.match, tonumber
 local strupper, strlower = string.upper, string.lower
@@ -181,6 +184,136 @@ local function ApplyLook(m, plate)
 end
 
 --------------------------------------------------------------------------------
+-- Keeping the unit map honest
+--
+-- ADDED and REMOVED are the fast path and are right almost all of the time.
+-- What they are not is a complete account of which plates exist, and a zone
+-- change is exactly where that gap opens: plates are torn down and rebuilt
+-- around PLAYER_ENTERING_WORLD rather than inside it, so an ADDED can land
+-- before the zone change is announced and a REMOVED can simply never arrive.
+--
+-- Trusting the events alone meant walking into a delve and marking nothing --
+-- the plates were already there, the map was wiped after their ADDED had been
+-- and gone, and no further event was coming -- and walking back out with
+-- markers still on screen for plates that no longer existed. Both cleared on
+-- /reload, which is the tell: the state was wrong, not the drawing.
+--
+-- So the events stay, and around a zone change the truth is re-derived from
+-- the client rather than accumulated from what it told us.
+--------------------------------------------------------------------------------
+
+-- Every token the client can hand out for a nameplate. A fixed list, walked
+-- rather than concatenated per pass, for the same reason Core caches its group
+-- tokens.
+local PLATE_UNITS = {}
+for i = 1, 40 do PLATE_UNITS[i] = "nameplate" .. i end
+
+local seenUnits = {}   -- scratch for Reconcile, wiped in place
+
+local function RetireMarker(unit, m)
+    m.pulse:Stop()
+    m:SetAlpha(1)
+    m:Hide()
+    activeByUnit[unit] = nil
+    -- The threat module's alert bookkeeping is keyed by this token and has to
+    -- go with it, or a token recycled onto a different mob inherits the last
+    -- one's history.
+    ns.ForgetUnit(unit)
+end
+
+-- Bring activeByUnit back in step with the plates that actually exist: adopt
+-- what we missed, retire what has gone. Idempotent, so it is safe to run
+-- repeatedly while the world is still streaming in.
+local function Reconcile()
+    twipe(seenUnits)
+
+    for i = 1, #PLATE_UNITS do
+        local u = PLATE_UNITS[i]
+        if UnitExists(u) then
+            seenUnits[u] = true
+            if not activeByUnit[u] then
+                local plate = C_NamePlate.GetNamePlateForUnit(u)
+                if plate then
+                    local m = AcquireMarker(plate)
+                    m._kind   = nil    -- force a full re-apply for this occupant
+                    m._serial = nil
+                    activeByUnit[u] = m
+                end
+            end
+        end
+    end
+
+    for u, m in pairs(activeByUnit) do
+        if not seenUnits[u] then RetireMarker(u, m) end
+    end
+end
+
+-- How long after a zone change to keep checking. The plates do not all exist
+-- the moment PLAYER_ENTERING_WORLD fires -- they arrive as the world streams
+-- in -- so a single pass at the announcement is not enough on its own.
+local RECONCILE_FOR   = 10
+local RECONCILE_EVERY = 0.25
+local reconcileUntil  = 0
+
+-- Counters, for /tt npdebug. Cheap, and the difference between "the reconcile
+-- ran and found nothing" and "the reconcile never ran" is otherwise invisible
+-- -- which is exactly the hole the first attempt at this fix fell into.
+local reconcileRuns = 0
+local refreshRuns   = 0
+local lastZoneAt    = 0
+
+-- Nameplate events seen, in total and since the last zone change.
+--
+-- A snapshot of what exists right now cannot tell "no plates have appeared
+-- since you got here" from "you happened to type this while nothing was on
+-- screen", and those are completely different bugs. Counters survive the mob
+-- dying before you finish typing.
+local addedSeen, removedSeen = 0, 0
+local addedSinceZone, adoptedSinceZone = 0, 0
+
+local function ReconcileWindowOpen()
+    reconcileUntil = (GetTime and GetTime() or 0) + RECONCILE_FOR
+    lastZoneAt = (GetTime and GetTime() or 0)
+    addedSinceZone, adoptedSinceZone = 0, 0
+end
+
+-- THE WINDOW NEEDS A DRIVER OF ITS OWN, AND THIS IS WHY
+--
+-- The obvious place to run it is ns.RefreshMarkers, which the threat scan
+-- calls on every tick. Except it does not: Threat's Tick has an idle fast path
+-- that returns without notifying anyone when nothing is worth scanning, and
+-- walking into an instance is precisely that moment -- no plates yet, an empty
+-- state map, nothing to report. So the window opened, nothing called it, and
+-- by the time the first mob appeared and the scan resumed the window had shut.
+-- The panel stayed blank until a reload, which is the bug this was meant to
+-- fix, still there after the first attempt at fixing it.
+--
+-- So the module drives its own. It sits on the shared ticker like everything
+-- else -- which means it is inside the same failure latch, and a marker sync
+-- that starts throwing stops on its own instead of once per frame forever.
+local function ReconcileTick()
+    if reconcileUntil == 0 then return end
+
+    local now = GetTime and GetTime() or 0
+    if now >= reconcileUntil then
+        reconcileUntil = 0
+        return
+    end
+
+    reconcileRuns = reconcileRuns + 1
+    local before = 0
+    for _ in pairs(activeByUnit) do before = before + 1 end
+
+    Reconcile()
+
+    local after = 0
+    for _ in pairs(activeByUnit) do after = after + 1 end
+    -- Adopting a plate only puts it in the map; drawing it is a separate step,
+    -- and the scan may not be running yet to ask for it.
+    if after ~= before then ns.RefreshMarkers() end
+end
+
+--------------------------------------------------------------------------------
 -- Refresh
 --------------------------------------------------------------------------------
 
@@ -232,6 +365,8 @@ end
 
 function ns.RefreshMarkers()
     if not db then return end
+
+    refreshRuns = refreshRuns + 1
 
     local stateByUnit = ns.stateByUnit
 
@@ -319,16 +454,12 @@ ns.RegisterEvent("PLAYER_ENTERING_WORLD", function()
         ns.RefreshOptions()
     end
 
-    -- A zone change also tears every nameplate down, and the matching REMOVED
-    -- events are not guaranteed to arrive. Drop the unit map so no marker is
-    -- left pointing at a token handed to something else.
-    for u, m in pairs(activeByUnit) do
-        m.pulse:Stop()
-        m:SetAlpha(1)
-        m:Hide()
-        activeByUnit[u] = nil
-        ns.ForgetUnit(u)
-    end
+    -- Once now, for the plates that already exist, and then for a few seconds
+    -- as the rest arrive. A blind wipe used to live here, which is what left
+    -- the delve unmarked: it threw away markers for plates whose ADDED had
+    -- already fired, and nothing was going to fire again.
+    Reconcile()
+    ReconcileWindowOpen()
 end)
 
 ns.RegisterEvent("NAME_PLATE_UNIT_ADDED", function(_, unit)
@@ -336,10 +467,14 @@ ns.RegisterEvent("NAME_PLATE_UNIT_ADDED", function(_, unit)
     -- event hands it over under the literal token "player", so compare the
     -- string: UnitIsUnit would be the natural test and is a secret boolean
     -- inside instances, which throws the moment it is tested.
+    addedSeen, addedSinceZone = addedSeen + 1, addedSinceZone + 1
+
     if unit == "player" then return end
 
     local plate = C_NamePlate.GetNamePlateForUnit(unit)
     if not plate then return end
+
+    adoptedSinceZone = adoptedSinceZone + 1
 
     local m = AcquireMarker(plate)
     m._kind   = nil        -- force a full re-apply for the new occupant
@@ -348,16 +483,16 @@ ns.RegisterEvent("NAME_PLATE_UNIT_ADDED", function(_, unit)
 end)
 
 ns.RegisterEvent("NAME_PLATE_UNIT_REMOVED", function(_, unit)
+    removedSeen = removedSeen + 1
     local m = activeByUnit[unit]
     if m then
-        m.pulse:Stop()
-        m:SetAlpha(1)
-        m:Hide()
-        activeByUnit[unit] = nil
+        RetireMarker(unit, m)
+    else
+        -- Still unconditional: the threat module's alert bookkeeping is keyed
+        -- by this token and has to be dropped whether or not we ever built a
+        -- marker for it.
+        ns.ForgetUnit(unit)
     end
-    -- Unconditional: the threat module's alert bookkeeping is keyed by this
-    -- token and has to be dropped whether or not we ever built a marker for it.
-    ns.ForgetUnit(unit)
 end)
 
 --------------------------------------------------------------------------------
@@ -366,6 +501,11 @@ end)
 
 function M:OnInit()
     db = self.db
+
+    -- Its own ticker rather than a hook into the scan's, so the post-zone
+    -- reconcile keeps running through exactly the moment the scan decides
+    -- there is nothing worth scanning.
+    ns.RegisterTicker("markersync", "marker sync", RECONCILE_EVERY, ReconcileTick)
 
     ns.RegisterThreatConsumer{
         -- Preview forces the scan on even out of a tank spec: the whole point
@@ -387,6 +527,86 @@ local function Toggle(key, label)
         Print(label .. " " .. (db[key] and "enabled." or "disabled."))
     end
 end
+
+-- Hidden. Prints the whole chain between "a plate exists" and "a glyph is on
+-- screen", because every link in it fails silently and they all look the same
+-- from the chair.
+local function DumpPlates()
+    local now = GetTime and GetTime() or 0
+
+    Print("|cffffff00---- nameplate markers ----|r")
+    Print(format("markers wanted=%s  preview=%s  db=%s",
+                 tostring(MarkersWanted()), tostring(previewMode),
+                 tostring(db ~= nil)))
+    Print(format("plate events: added=%d (|cffffff00%d since this zone|r, "
+                 .. "%d gave us a plate)  removed=%d",
+                 addedSeen, addedSinceZone, adoptedSinceZone, removedSeen))
+    Print(format("refreshes=%d  reconciles=%d  window=%s  last zone %.1fs ago",
+                 refreshRuns, reconcileRuns,
+                 (reconcileUntil > 0)
+                     and format("|cff00ff00open %.1fs|r", reconcileUntil - now)
+                     or "|cff888888shut|r",
+                 (lastZoneAt > 0) and (now - lastZoneAt) or -1))
+
+    for _, name in ipairs({ "markersync", "threat" }) do
+        local t = ns.GetTicker(name)
+        if not t then
+            Print(format("ticker %s: |cffff4040NOT REGISTERED|r", name))
+        elseif t.disabled then
+            Print(format("ticker %s: |cffff4040stopped|r -- %s",
+                         name, tostring(t.err)))
+        else
+            Print(format("ticker %s: |cff00ff00running|r (failures=%d)",
+                         name, t.failures or 0))
+        end
+    end
+
+    local live, tracked, drawn = 0, 0, 0
+    for i = 1, #PLATE_UNITS do
+        local u = PLATE_UNITS[i]
+        if UnitExists(u) then
+            live = live + 1
+            local plate = C_NamePlate.GetNamePlateForUnit(u)
+            local m = activeByUnit[u]
+            if m then tracked = tracked + 1 end
+            local shown = m and m:IsShown()
+            if shown then drawn = drawn + 1 end
+            Print(format("  %-12s plate=%s  tracked=%s  shown=%s  state=%s",
+                         u, plate and "yes" or "|cffff4040no|r",
+                         m and "yes" or "|cffff4040no|r",
+                         shown and "|cff00ff00yes|r" or "no",
+                         tostring(ns.stateByUnit[u])))
+        end
+    end
+
+    Print(format("live plates=%d  tracked=%d  drawn=%d", live, tracked, drawn))
+    if live == 0 and addedSinceZone == 0 then
+        Print("|cffff8000No plate has been announced since you arrived, and "
+              .. "none exists now.|r If glyphs are missing while mobs are on "
+              .. "screen, run this again |cffffff00with those mobs in front of "
+              .. "you|r -- this snapshot was taken with nothing to mark.")
+    elseif live == 0 and addedSinceZone > 0 then
+        Print(format("|cffff8000%d plates were announced here but none exists "
+                     .. "now.|r Either they are all gone, or the client stopped "
+                     .. "answering UnitExists for their tokens -- run this with "
+                     .. "mobs on screen to tell those apart.", addedSinceZone))
+    elseif live > 0 and tracked == 0 then
+        Print("|cffff8000Plates exist and none is tracked.|r The unit map was "
+              .. "not rebuilt -- reconciles above should be climbing while the "
+              .. "window is open.")
+    elseif tracked > 0 and drawn == 0 then
+        Print("|cffff8000Tracked but nothing drawn.|r The map is fine; this is "
+              .. "the threat state or the marker toggles -- see "
+              .. "|cffffff00/tt status|r.")
+    end
+end
+
+ns.RegisterCommand{
+    name = "npdebug", hidden = true,
+    section = "markers:", order = 5,
+    desc = "why is no glyph on screen",
+    handler = DumpPlates,
+}
 
 ns.RegisterCommand{
     name = "nptest", aliases = { "nppreview" },

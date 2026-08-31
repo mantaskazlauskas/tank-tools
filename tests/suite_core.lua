@@ -35,6 +35,42 @@ ok(NS.ready ~= true, "not ready before ADDON_LOADED")
 ok(NS.GetModule("threat") ~= nil, "threat module registered")
 ok(NS.GetModule("nameplates") ~= nil, "nameplates module registered")
 
+-- A module that is still behind its flag, so the gate has something to gate.
+--
+-- The co-tank panel used to play this part, and then it shipped. What these
+-- sections test is the gate, not any particular module, so the gate gets a
+-- module of its own rather than being retired along with the last real one --
+-- otherwise the machinery that hides unfinished work goes untested until the
+-- next time somebody needs it, which is the worst moment to find out.
+--
+-- Registered here because this runs before ADDON_LOADED, which is when the
+-- database resolves and OnInit is called: exactly the window a real module
+-- registers in.
+NS.RegisterFeature{
+    name    = "labrat",
+    title   = "Lab rat",
+    default = false,
+    desc    = "A feature that exists only in the suite.",
+}
+
+local LAB = NS.NewModule("labrat", { feature = "labrat", defaults = { labSize = 3 } })
+function LAB:OnInit()
+    NS.RegisterTicker("labrat", "lab rat", 1, function() end)
+end
+
+NS.RegisterCommandSection("lab:", 90)
+NS.RegisterCommand{
+    name = "labrat", feature = "labrat", section = "lab:", order = 10,
+    desc = "does nothing at all",
+    handler = function() NS.Print("lab rat ran") end,
+}
+NS.RegisterOptionsSection{
+    page = "Lab", pageOrder = 90, column = "left", order = 10,
+    feature = "labrat",
+    build = function(f, x, y) return NS.ui.Note(f, x, y, "lab") end,
+}
+NS.RegisterStatusProvider(90, function() NS.Print("lab rat: yes") end, "labrat")
+
 if SCENARIO == "tabs" then
     -- Stand in for a third module's settings page. Registered at load time,
     -- which is when a real module registers: the panel is built once, on
@@ -142,6 +178,129 @@ local before = 0
 for _ in pairs(WORLD.units) do before = before + 1 end
 FireEvent("NAME_PLATE_UNIT_ADDED", "player")
 ok(true, "player plate token ignored without error")
+
+--------------------------------------------------------------------------------
+section("zone change keeps the unit map honest")
+--
+-- The reported bug, both directions: walk into a delve and nothing marks; walk
+-- back out and the markers stay on screen. /reload fixed both, which is what
+-- said the state was wrong rather than the drawing.
+--
+-- Plates are torn down and rebuilt *around* PLAYER_ENTERING_WORLD, not inside
+-- it. An ADDED can land before the zone change is announced, and a REMOVED can
+-- never arrive at all -- so a handler that blindly wiped the map on PEW threw
+-- away markers for plates that were still there, with nothing coming to
+-- rebuild them.
+--
+-- Asserted on the marker, not on NS.stateByUnit: the threat scan walks the
+-- nameplate tokens itself and fills that map whether or not a marker exists,
+-- so it answers the same either way and would pass against the bug.
+--------------------------------------------------------------------------------
+
+local function MarkerShown(unit)
+    local plate = NAMEPLATES[unit]
+    if not plate then return false end
+    for _, f in ipairs(FramesParentedTo(plate)) do
+        if f:IsShown() then return true end
+    end
+    return false
+end
+
+npdb.npMarker = true
+
+-- Entering. The plate is already up before the zone change is announced, which
+-- is the ordering the events do not promise and the client does not always
+-- give.
+NAMEPLATES["nameplate4"] = CreateFrame("Frame", nil, UIParent)
+WORLD.units["nameplate4"] = { name = "Delve Add", combat = true, threat = { player = 0 } }
+FireEvent("NAME_PLATE_UNIT_ADDED", "nameplate4")
+Tick(0.25)
+ok(MarkerShown("nameplate4"), "a plate added before the zone change is marked")
+
+FireEvent("PLAYER_ENTERING_WORLD")
+Tick(0.25)
+ok(MarkerShown("nameplate4"),
+   "and is still marked after it, with no second ADDED to rebuild from")
+
+-- ...and one that only appears once we are inside, with no ADDED at all.
+NAMEPLATES["nameplate5"] = CreateFrame("Frame", nil, UIParent)
+WORLD.units["nameplate5"] = { name = "Late Add", combat = true, threat = { player = 0 } }
+Tick(0.25)
+ok(MarkerShown("nameplate5"),
+   "a plate that streams in afterwards is adopted without an event")
+
+-- Leaving. Both plates go and no REMOVED arrives for either.
+local goneA, goneB = NAMEPLATES["nameplate4"], NAMEPLATES["nameplate5"]
+NAMEPLATES["nameplate4"], WORLD.units["nameplate4"] = nil, nil
+NAMEPLATES["nameplate5"], WORLD.units["nameplate5"] = nil, nil
+FireEvent("PLAYER_ENTERING_WORLD")
+Tick(0.25)
+
+local function AnyShown(plate)
+    for _, f in ipairs(FramesParentedTo(plate)) do
+        if f:IsShown() then return true end
+    end
+    return false
+end
+ok(not AnyShown(goneA), "a marker whose plate vanished is hidden anyway")
+ok(not AnyShown(goneB), "both of them")
+eq(NS.stateByUnit["nameplate4"], nil, "and the threat bookkeeping goes with it")
+
+-- The case the first attempt at this fix missed entirely. Walk into somewhere
+-- with no plates at all: Threat's Tick takes its idle fast path and returns
+-- without notifying anyone, so anything hanging off ns.RefreshMarkers never
+-- runs. The reconcile window has to survive that, which is why the module
+-- drives it from its own ticker rather than from the scan's notifications.
+for i = 1, 3 do
+    NAMEPLATES["nameplate" .. i], WORLD.units["nameplate" .. i] = nil, nil
+end
+Tick(0.25); Tick(0.25)
+eq(next(NS.stateByUnit), nil, "nothing to scan, so the scan is idling")
+
+FireEvent("PLAYER_ENTERING_WORLD")
+Tick(0.25)
+
+-- A plate appears with no ADDED event, while the scan is still idle.
+NAMEPLATES["nameplate7"] = CreateFrame("Frame", nil, UIParent)
+WORLD.units["nameplate7"] = { name = "Quiet Add", combat = true, threat = { player = 0 } }
+Tick(0.25)
+ok(MarkerShown("nameplate7"),
+   "adopted even though the scan never notified anybody")
+
+NAMEPLATES["nameplate7"], WORLD.units["nameplate7"] = nil, nil
+FireEvent("NAME_PLATE_UNIT_REMOVED", "nameplate7")
+Tick(0.25)
+
+-- The window is not open forever. Once it lapses the events carry the load
+-- again, so an unannounced plate waits for its ADDED rather than being adopted
+-- by a reconcile that never stops running.
+TIME = TIME + 10
+Tick(0.25)
+NAMEPLATES["nameplate6"] = CreateFrame("Frame", nil, UIParent)
+WORLD.units["nameplate6"] = { name = "Silent Add", combat = true, threat = { player = 0 } }
+Tick(0.25)
+ok(not MarkerShown("nameplate6"),
+   "outside the window an unannounced plate is left to its ADDED event")
+
+FireEvent("NAME_PLATE_UNIT_ADDED", "nameplate6")
+Tick(0.25)
+ok(MarkerShown("nameplate6"), "which still works exactly as before")
+
+NAMEPLATES["nameplate6"], WORLD.units["nameplate6"] = nil, nil
+FireEvent("NAME_PLATE_UNIT_REMOVED", "nameplate6")
+Tick(0.25)
+
+-- Put the three mobs the rest of the suite was built on back.
+WORLD.units["nameplate1"] = { name = "Add A", combat = true, threat = { player = 0 } }
+WORLD.units["nameplate2"] = { name = "Add B", combat = true, threat = { player = 2 } }
+WORLD.units["nameplate3"] = { name = "Add C", combat = true, threat = { player = 3 } }
+for i = 1, 3 do
+    local u = "nameplate" .. i
+    NAMEPLATES[u] = NAMEPLATES[u] or CreateFrame("Frame", nil, UIParent)
+    FireEvent("NAME_PLATE_UNIT_ADDED", u)
+end
+Tick(0.25)
+eq(NS.stateByUnit["nameplate1"], NS.STATE_LOST, "the original three are back")
 
 --------------------------------------------------------------------------------
 section("idle fast path")
@@ -388,13 +547,16 @@ ok(not panel:IsShown(), "toggle hides")
 section("feature flags")
 --------------------------------------------------------------------------------
 
--- The co-tank panel is the flagged module at the time of writing. If it ever
--- ships, this section moves to whatever is behind the flag next -- what is
--- being tested is the gate, not the module.
 ok(NS.GetModule("features") ~= nil, "features module registered")
-ok(NS.GetFeature("cotanks") ~= nil, "the co-tank panel registered a flag")
-eq(db.modules.features.cotanks, false, "flag defaults to off")
-eq(NS.FeatureEnabled("cotanks"), false, "...and reads as off")
+ok(NS.GetFeature("labrat") ~= nil, "the unfinished module registered a flag")
+eq(db.modules.features.labrat, false, "flag defaults to off")
+eq(NS.FeatureEnabled("labrat"), false, "...and reads as off")
+
+-- The other half, and the reason this section was rewritten: the co-tank
+-- panel used to be the thing behind the flag. It ships now, so it has to be
+-- fully present -- no flag, and every part of it registered unconditionally.
+eq(NS.GetFeature("cotanks"), nil, "the co-tank panel no longer has a flag")
+ok(NS.GetTicker("tankwatch") ~= nil, "its module started")
 
 -- Gating is opt-in, so a name nobody registered is allowed through. A stale
 -- `feature = "..."` left on a command after the flag is deleted must not
@@ -402,8 +564,8 @@ eq(NS.FeatureEnabled("cotanks"), false, "...and reads as off")
 eq(NS.FeatureEnabled("nosuchfeature"), true, "an unregistered flag is enabled")
 
 -- The whole point: a gated module never starts, so nothing of it is running.
-eq(NS.GetTicker("tankwatch"), nil, "a gated module registers no ticker")
-ok(TankToolsDB.modules.tankwatch ~= nil, "...but its settings still exist")
+eq(NS.GetTicker("labrat"), nil, "a gated module registers no ticker")
+ok(TankToolsDB.modules.labrat ~= nil, "...but its settings still exist")
 
 -- Not in the help, and not dispatchable. An unknown verb falls through to the
 -- help block, which is the tell for both.
@@ -411,12 +573,16 @@ local nf = #CHAT
 Slash("")
 local helpText = ""
 for _, line in ipairs(ChatSince(nf)) do helpText = helpText .. Strip(line) .. "\n" end
-ok(helpText:find("/tt tw") == nil, "help does not list a gated command")
-ok(helpText:find("co%-tanks:") == nil, "an empty section prints no header")
+ok(helpText:find("/tt labrat") == nil, "help does not list a gated command")
+ok(helpText:find("lab:") == nil, "an empty section prints no header")
 ok(helpText:find("/tt features") == nil, "the hidden command is not listed either")
 
+-- ...while the shipped one is listed in full.
+ok(helpText:find("co%-tanks:") ~= nil, "a shipped section gets its header")
+ok(helpText:find("/tt twlock") ~= nil, "and its commands")
+
 local nf2 = #CHAT
-Slash("tw")
+Slash("labrat")
 local fell = false
 for _, out in ipairs(ChatSince(nf2)) do
     if Strip(out) == "commands:" then fell = true end
@@ -424,17 +590,20 @@ end
 ok(fell, "a gated command does not dispatch")
 
 -- No tab for it, and no status lines from a module that never started.
-local hasPage = false
+local hasLab, hasCoTanks = false, false
 for _, p in ipairs(NS.optionsPages) do
-    if p.name == "Co-tanks" then hasPage = true end
+    if p.name == "Lab" then hasLab = true end
+    if p.name == "Co-tanks" then hasCoTanks = true end
 end
-ok(not hasPage, "a gated settings page is dropped")
+ok(not hasLab, "a gated settings page is dropped")
+ok(hasCoTanks, "...and a shipped one is kept")
 
 local nf3 = #CHAT
 Slash("status")
 local statusText = ""
 for _, line in ipairs(ChatSince(nf3)) do statusText = statusText .. Strip(line) .. "\n" end
-ok(statusText:find("co%-tank panel:") == nil, "a gated status provider stays quiet")
+ok(statusText:find("lab rat:") == nil, "a gated status provider stays quiet")
+ok(statusText:find("co%-tank panel:") ~= nil, "a shipped one speaks up")
 
 --------------------------------------------------------------------------------
 section("the feature window")
@@ -460,15 +629,15 @@ ok(box ~= nil, "one checkbox per registered feature")
 -- A real click toggles the box first, then runs OnClick.
 box:SetChecked(true)
 box._scripts.OnClick(box)
-eq(NS.FeatureEnabled("cotanks"), true, "ticking the box sets the flag")
-eq(db.modules.features.cotanks, true, "...and it is saved")
+eq(NS.FeatureEnabled("labrat"), true, "ticking the box sets the flag")
+eq(db.modules.features.labrat, true, "...and it is saved")
 eq(NS.FeatureNeedsReload(), true, "...and a reload is now needed")
 
 -- Toggling back to the state the modules were started with leaves nothing to
 -- apply, so the window must stop asking for a reload.
 box:SetChecked(false)
 box._scripts.OnClick(box)
-eq(NS.FeatureEnabled("cotanks"), false, "unticking clears the flag")
+eq(NS.FeatureEnabled("labrat"), false, "unticking clears the flag")
 eq(NS.FeatureNeedsReload(), false, "back where we started -- nothing to apply")
 
 NS.ToggleFeatures()

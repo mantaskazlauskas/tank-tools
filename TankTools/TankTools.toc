@@ -1,8 +1,8 @@
 ## Interface: 120000, 120001, 120005, 120007, 120100
 ## Title: Tank Tools
-## Notes: Marks enemy nameplates by threat, so you can see at a glance what is not yours.
+## Notes: Marks enemy nameplates by threat, so yowa can see at a glance what is not yours.
 ## Author: mmantas
-## Version: 1.0.1
+## Version: 1.0.2
 ## SavedVariables: TankToolsDB
 ## OptionalDeps: EllesmereUI
 ## Category: Combat

@@ -62,26 +62,24 @@ local Clean, IsTrue, Show = ns.Clean, ns.IsTrue, ns.Show
 local Print = ns.Print
 local state = ns.state
 
--- Still being worked on: off unless the flag is set, which is what keeps its
--- commands out of the help and its tab out of the settings window. Everything
--- below still loads and is still covered by the test suite -- being gated
--- costs the module its OnInit, and nothing else.
-ns.RegisterFeature{
-    name    = "cotanks",
-    title   = "Co-tank panel",
-    default = false,
-    desc    = "Health, debuff stacks and the aggro ring for\n"
-              .. "every tank in the group. Renders, but the\n"
-              .. "restricted-value behaviour is unproven.",
-}
-
 local M = ns.NewModule("tankwatch", {
-    feature  = "cotanks",
     defaults = {
         twEnabled     = true,
         twShowSelf    = true,    -- your own block, first in the row
         twMinTanks    = 2,       -- hide below this many tanks in the group
-        twSoloDungeon = false,   -- ...except in a five-man, where you are it
+        -- ...except inside an instance, where a lone tank is still worth
+        -- drawing.
+        --
+        -- On by default, which is the opposite of how it shipped. It began as
+        -- a way to exercise the restricted-value paths without organising
+        -- nineteen other people, and off was the right default for a debugging
+        -- aid. It is not one: being the only tank in a delve or a five-man is
+        -- the ordinary case, and a panel that stays hidden through all of it
+        -- until you find a checkbox is a panel most people conclude is broken.
+        --
+        -- Outside an instance it still changes nothing, which is what stops
+        -- this being "show a panel of myself while questing".
+        twSoloDungeon = true,
         twLayout      = "ROW",   -- ROW | COLUMN -- tanks beside or below
         twAuraAnchor  = "RIGHT", -- LEFT | RIGHT -- which side of the bar
         twMaxAuras    = 5,
@@ -97,6 +95,17 @@ local M = ns.NewModule("tankwatch", {
         -- debuffs. DBM ships it off for the same reason. Showing too much is
         -- recoverable by looking; showing nothing is not.
         twBossAuras   = false,
+        -- The other direction, and the one people reach for when the row is
+        -- empty: draw every harmful aura, whoever applied it and whether or
+        -- not the encounter flagged it. It overrides twBossAuras rather than
+        -- being blocked by it -- a setting called "show every debuff" that
+        -- another checkbox can silently veto is worse than no setting.
+        --
+        -- The short never-show list still applies. Sated and Stagger are
+        -- permanently on somebody and say nothing about a tank swap; the
+        -- escape hatch for even those is /tt twfilter, which is a question
+        -- rather than a preference.
+        twAllAuras    = false,
         twBarWidth    = 150,
         twBarHeight   = 20,
         twIconSize    = 22,
@@ -131,6 +140,25 @@ local LAYOUTS = { ROW = true, COLUMN = true }
 local previewMode = false
 local looksSerial = 0     -- bumped when a layout setting changes
 local builtSerial = -1
+
+-- How much of the aura row's candidate filtering to apply -- see
+-- CandidateFilters in UI/AuraRow.lua. Session-only and not a setting: it
+-- exists to answer "is a filter eating my debuffs", and an answer you can save
+-- is one you will still be running six weeks later without remembering why.
+local FILTERS    = { "normal", "loose", "none" }
+local filterMode = "normal"
+
+-- What the row is actually asked for, which is two things joined: a saved
+-- setting and a session-only debug override.
+--
+-- The override wins when it is set, because someone who has just typed
+-- /tt twfilter is asking a question right now and should not have to work out
+-- which checkbox is arguing with them. When it is not, "show every debuff"
+-- maps onto the same loose rung -- the never-show list and nothing else.
+local function FilterMode()
+    if filterMode ~= "normal" then return filterMode end
+    return db.twAllAuras and "loose" or "normal"
+end
 
 -- Which tank units we are currently drawing, so UNIT_AURA can tell in one
 -- lookup whether an event concerns us.
@@ -203,6 +231,7 @@ local function LayoutAuras(b)
         grow     = left and "LEFT" or "RIGHT",
         tooltips = db.twTooltips,
         bossOnly = db.twBossAuras,
+        filter   = FilterMode(),
     }
 
     -- Anchored so the first icon is the one nearest the bar on either side.
@@ -406,18 +435,32 @@ local function Hide()
     end
 end
 
+-- Where a lone tank is worth drawing.
+--
+-- The restriction that shapes this whole module is not a raid rule, it is an
+-- instance rule: the client hands back secrets and refuses aura enumeration
+-- inside instanced content generally. A delve is instanced content -- it
+-- reports as "scenario" -- so a debuff that renders there is a debuff that
+-- renders in a raid, and it can be checked alone in five minutes rather than
+-- by asking nineteen other people to hold.
+--
+-- Which is why this is a list of instance types rather than just "party".
+-- Excluded on purpose: the open world, and the two PvP types, where a panel of
+-- yourself is only ever in the way. An instance type Core did not recognise
+-- reads as "none" and lands outside this list -- /tt cotanks prints the raw
+-- string the client gave, which is the line to look at if a new kind of
+-- content ships and the panel does not appear in it.
+local SOLO_TYPES = { party = true, raid = true, scenario = true }
+
 -- How many tanks the group needs before the panel is worth the screen space.
 --
--- In a five-man you are normally the only tank, so the tank-swap question the
--- panel exists to answer is not in play, and the default minimum of two keeps
--- it off screen. But your own debuffs are drawn by exactly the code that draws
--- a co-tank's in a raid -- same reads, same setters, same restrictions -- and a
--- dungeon is where that can be checked without asking nineteen other people to
--- hold. So "solo in dungeons" drops the minimum to one, and only there: not in
--- the open world, not in a battleground, and not while you are standing in a
--- capital city with a panel of yourself in the way.
+-- Out of the box it is two: the tank-swap question the panel exists to answer
+-- is not in play when you are the only tank, so it stays off screen. The
+-- opt-in drops it to one inside instanced content, where your own bar goes
+-- through exactly the code a co-tank's goes through in a raid -- same reads,
+-- same setters, same restrictions.
 local function MinTanks()
-    if db.twSoloDungeon and state.instanceType == "party" then return 1 end
+    if db.twSoloDungeon and SOLO_TYPES[state.instanceType] then return 1 end
     return db.twMinTanks
 end
 
@@ -619,9 +662,17 @@ end
 local function DumpTanks()
     local tanks = ns.tankUnits
     Print("|cffffff00---- co-tanks ----|r")
-    Print(format("instance=%s (%s)  tanks=%d  drawn=%d  min=%d",
+    -- Both the validated type and what the client actually said. They differ
+    -- exactly when Blizzard reports a type Core does not list, which is the
+    -- one failure mode of the solo gate that looks like nothing at all.
+    local raw = state.instanceTypeRaw or "?"
+    Print(format("instance=%s (%s%s)  tanks=%d  drawn=%d  min=%d  solo-here=%s",
                  Show(state.inInstance), tostring(state.instanceType),
-                 #tanks, #shownUnits, MinTanks()))
+                 (raw ~= state.instanceType) and (" <- client said '" .. raw .. "'")
+                     or "",
+                 #tanks, #shownUnits, MinTanks(),
+                 SOLO_TYPES[state.instanceType] and "|cff00ff00yes|r"
+                     or "|cffff4040no|r"))
 
     -- Which slot the client says we are. A nil here is what put two copies of
     -- us on screen, so it is worth stating outright rather than inferring.
@@ -705,13 +756,50 @@ local function DumpTanks()
                              tostring(r.group), r.built, tostring(r.bound)))
                 Print(format("      container shown=%s rect=%s   "
                              .. "host shown=%s   want %dx%d",
-                             tostring(r.shown), r.rect, tostring(r.hostShown),
+                             r.shown, r.rect, tostring(r.hostShown),
                              r.width, r.size))
-                Print(format("      filter: bossOrRoleAura=%s  max=%d",
-                             tostring(r.bossOnly), r.max))
+                Print(format("      filter: mode=%s  bossOrRoleAura=%s  max=%d",
+                             tostring(r.filter), tostring(r.bossOnly), r.max))
+
+                -- Buttons built with none shown is the group matching nothing,
+                -- which usually means a filter. Buttons shown at 0x0 is our
+                -- own layout losing icons the engine did match. The two look
+                -- identical on screen and have nothing in common as bugs --
+                -- and inside an instance the client often refuses to say which
+                -- it is, which is a third answer rather than a missing one.
+                Print(format("      |cffffff00buttons: built=%d shown=%d "
+                             .. "unreadable=%d|r   first is %s",
+                             r.built, r.visible or 0, r.visSecret or 0,
+                             r.firstRect or "n/a"))
+                if r.firstRect and r.firstRect:find("^0 ") then
+                    Print("      |cffff4040That button is zero-sized, so it "
+                          .. "draws nothing however many the engine shows.|r "
+                          .. "Nothing in the engine gives an AuraButton a "
+                          .. "rect; we have to, and only during "
+                          .. "initializeFrame.")
+                end
+
+                if r.bossOnly and r.filter == "normal" then
+                    Print("      |cffff8000\"Boss and role debuffs only\" is "
+                          .. "ON.|r Outside a boss encounter almost nothing "
+                          .. "carries those flags -- a delve's debuffs "
+                          .. "generally do not -- so this filter alone will "
+                          .. "empty the row. Turn it off, or run "
+                          .. "|cffffff00/tt twfilter|r to step past it without "
+                          .. "changing the setting. |cffffff00/tt twall|r is "
+                          .. "the setting that overrides it for good.")
+                elseif r.built > 0 and (r.visible or 0) == 0
+                       and (r.visSecret or 0) == 0 then
+                    Print("      |cffff8000The engine built buttons and is "
+                          .. "showing none.|r Walk |cffffff00/tt twfilter|r "
+                          .. "-- if icons appear on loose or none, a candidate "
+                          .. "filter is dropping them.")
+                end
             elseif r.engine then
                 Print("    debuffs: |cffff4040the engine exists but this row "
-                      .. "could not use it|r -- fell back to reading")
+                      .. "could not use it|r -- fell back to reading, which "
+                      .. "draws nothing while auras are restricted")
+                Print("      |cffffff00/tt twapi|r says which call it was.")
             else
                 Print(format("    debuffs: |cffff8000read by the addon|r -- "
                              .. "no aura engine on this client. drawn=%s",
@@ -751,13 +839,144 @@ local function DumpTanks()
 end
 
 --------------------------------------------------------------------------------
+-- /tt twauras -- what is actually on the unit, and what we would do with it
+--
+-- "I have debuffs and the panel shows none" is two claims, and the panel can
+-- only ever show you the second one. This is the first: every harmful aura the
+-- client will still enumerate, the three fields our filters look at, and a
+-- verdict per aura saying whether we would have drawn it.
+--
+-- Where enumeration is refused it says so and stops, and that is itself the
+-- answer: on that client nothing but the engine can see these auras, so the
+-- fields below cannot be checked from here and the fault is downstream.
+--------------------------------------------------------------------------------
+
+local function DumpAuras()
+    local units = shownUnits
+    if #units == 0 then units = ns.tankUnits end
+    if #units == 0 then
+        Print("|cffff8000No tanks to inspect.|r Run |cffffff00/tt cotanks|r "
+              .. "first -- while the panel is drawing nobody, the aura row is "
+              .. "not the problem yet.")
+        return
+    end
+
+    Print("|cffffff00---- harmful auras ----|r")
+    Print(format("engine=%s   enumeration restricted=%s   filter mode=%s",
+                 ns.HaveAuraEngine() and "|cff00ff00yes|r" or "|cffff4040no|r",
+                 ns.AurasRestricted() and "|cffff8000yes|r" or "|cff00ff00no|r",
+                 FilterMode()))
+
+    if not (C_UnitAuras and C_UnitAuras.GetAuraDataByIndex) then
+        Print("|cffff4040This client has no C_UnitAuras.GetAuraDataByIndex.|r")
+        return
+    end
+
+    for i = 1, #units do
+        local u = units[i]
+        local b = BlockFor(u)
+        local row = b and b.auras
+
+        Print(format("|cffffff00%s|r  %s", u,
+                     tostring(Clean(UnitName(u)) or "?")))
+
+        local found = 0
+        for idx = 1, 40 do
+            local ok, a = pcall(C_UnitAuras.GetAuraDataByIndex, u, idx, "HARMFUL")
+            if not ok then
+                Print("    |cffff4040the client refused the read|r -- aura "
+                      .. "enumeration is restricted here, so this list cannot "
+                      .. "be built at all. Only the engine can see them, and "
+                      .. "the engine is what draws the row.")
+                Print("    That is the normal answer in combat and in an "
+                      .. "encounter. Run this |cffffff00out of combat|r -- the "
+                      .. "same delve, before the pull -- to see the auras and "
+                      .. "what the filters make of them. In combat, "
+                      .. "|cffffff00/tt cotanks|r is the one that still "
+                      .. "answers: it reads our own frames, not the client's.")
+                found = -1
+                break
+            end
+            if not a then break end
+
+            found = found + 1
+            Print(format("    |cffffff00%d.|r %s   id=%s",
+                         idx, tostring(Clean(a.name) or "?"), Show(a.spellId)))
+            Print(format("        stacks=%s  boss=%s  tankRole=%s",
+                         Show(a.applications), Show(a.isBossAura),
+                         Show(a.isTankRoleAura)))
+            Print(format("        fromPlayerOrPet=%s  source=%s",
+                         Show(a.isFromPlayerOrPlayerPet), Show(a.sourceUnit)))
+            if row then Print("        " .. row:Verdict(a)) end
+        end
+
+        if found == 0 then
+            Print("    |cff888888the read was allowed and there is nothing "
+                  .. "harmful on this unit|r")
+        end
+    end
+end
+
+--------------------------------------------------------------------------------
+-- /tt twapi -- what this client's aura engine actually offers
+--
+-- Every call the row makes into the engine is wrapped in a pcall, which is
+-- correct for surviving a widget that keeps moving and useless for finding out
+-- that it moved. This asks out loud.
+--------------------------------------------------------------------------------
+
+local function DumpApi()
+    local p = ns.AuraEngineProbe()
+
+    Print("|cffffff00---- aura engine ----|r")
+    Print(format("Blizzard_AuraContainer loaded=%s   "
+                 .. "CreateFrame(\"AuraContainer\")=%s",
+                 tostring(p.blizzAddon),
+                 p.created and "|cff00ff00ok|r" or "|cffff4040failed|r"))
+    if not p.created then
+        Print("    |cffff4040" .. tostring(p.err) .. "|r")
+        Print("The row cannot use the engine at all, so it falls back to "
+              .. "reading auras itself -- and that refuses to read while auras "
+              .. "are restricted. That is a blank row in any instance.")
+        return
+    end
+
+    Print("methods present: |cff00ff00" .. table.concat(p.methods, ", ") .. "|r")
+    if #p.missing > 0 then
+        Print("|cffff4040missing:|r " .. table.concat(p.missing, ", "))
+    end
+    Print(format("enums: sort=%s  direction=%s  flow=%s",
+                 tostring(p.sortEnum), tostring(p.dirEnum),
+                 tostring(p.flowEnum)))
+
+    -- The button side, which can only be answered by a row that has actually
+    -- been handed a button.
+    local seen
+    for i = 1, #blocks do
+        local r = blocks[i].auras and blocks[i].auras:Report()
+        if r and r.buttonAPI then seen = r; break end
+    end
+    if seen then
+        Print("AuraButton setters this client offers:")
+        Print("    |cff00ff00" .. table.concat(seen.buttonAPI, ", ") .. "|r")
+        if seen.wireErr then
+            Print("|cffff4040decoration refused:|r " .. seen.wireErr)
+        end
+    else
+        Print("|cff888888No button has been handed to us yet, so the "
+              .. "AuraButton method list is unknown. Get the panel drawing a "
+              .. "tank and run this again.|r")
+    end
+end
+
+--------------------------------------------------------------------------------
 -- Commands
 --------------------------------------------------------------------------------
 
 ns.RegisterCommandSection("co-tanks:", 25)
 
 ns.RegisterCommand{
-    name = "tw", feature = "cotanks", section = "co-tanks:", order = 10,
+    name = "tw", section = "co-tanks:", order = 10,
     desc = "toggle the co-tank panel",
     handler = function()
         db.twEnabled = not db.twEnabled
@@ -767,7 +986,7 @@ ns.RegisterCommand{
 }
 
 ns.RegisterCommand{
-    name = "twlock", feature = "cotanks", section = "co-tanks:", order = 20,
+    name = "twlock", section = "co-tanks:", order = 20,
     desc = "lock the panel in place",
     handler = function()
         db.twLocked = not db.twLocked
@@ -777,24 +996,24 @@ ns.RegisterCommand{
 }
 
 ns.RegisterCommand{
-    name = "twsolo", feature = "cotanks", section = "co-tanks:", order = 25,
-    desc = "show the panel in dungeons when you are the only tank",
+    name = "twsolo", section = "co-tanks:", order = 25,
+    desc = "show the panel when you are the only tank in an instance",
     handler = function()
         db.twSoloDungeon = not db.twSoloDungeon
         ns.RefreshTankWatch()
         if db.twSoloDungeon then
-            Print("co-tank panel shows |cff00ff00solo in five-mans|r -- your own "
-                  .. "bar and debuffs, drawn by the same code that draws a "
-                  .. "co-tank's in a raid.")
+            Print("co-tank panel shows |cff00ff00solo in instanced content|r "
+                  .. "-- dungeons, delves and raids. Your own bar and debuffs, "
+                  .. "drawn by the same code that draws a co-tank's in a raid.")
         else
             Print("co-tank panel needs " .. db.twMinTanks
-                  .. " tanks again, dungeons included.")
+                  .. " tanks again, instances included.")
         end
     end,
 }
 
 ns.RegisterCommand{
-    name = "twtest", feature = "cotanks", aliases = { "twpreview" },
+    name = "twtest", aliases = { "twpreview" },
     section = "co-tanks:", order = 30,
     desc = "show the panel with placeholder tanks",
     handler = function()
@@ -810,7 +1029,7 @@ ns.RegisterCommand{
 }
 
 ns.RegisterCommand{
-    name = "twlayout", feature = "cotanks", args = "<l>", section = "co-tanks:", order = 40,
+    name = "twlayout", args = "<l>", section = "co-tanks:", order = 40,
     desc = "tanks side by side (row) | stacked (column)",
     handler = function(_, larg)
         local l = larg and strupper(larg) or ""
@@ -828,8 +1047,57 @@ ns.RegisterCommand{
     end,
 }
 
+-- Hidden: this is an instrument, not a feature. It is in the help of nobody
+-- who has not already been told to run it.
 ns.RegisterCommand{
-    name = "twtips", feature = "cotanks", section = "co-tanks:", order = 60,
+    name = "twfilter", hidden = true,
+    section = "co-tanks:", order = 55,
+    desc = "cycle how much aura filtering the row applies",
+    handler = function()
+        local at = 1
+        for i = 1, #FILTERS do
+            if FILTERS[i] == filterMode then at = i end
+        end
+        filterMode = FILTERS[(at % #FILTERS) + 1]
+        ns.TankWatchLooksChanged()
+
+        if filterMode == "normal" then
+            Print("aura filter |cff00ff00normal|r -- whatever the settings say.")
+        elseif filterMode == "loose" then
+            Print("aura filter |cffffff00loose|r -- the never-show list only. "
+                  .. "Nothing about who applied the aura, and the boss/role "
+                  .. "filter is ignored.")
+        else
+            Print("aura filter |cffff8000none|r -- no filters at all. If icons "
+                  .. "appear now and not on normal, a candidate filter was "
+                  .. "eating them.")
+        end
+        Print("session only; it resets on reload.")
+    end,
+}
+
+ns.RegisterCommand{
+    name = "twall", section = "co-tanks:", order = 57,
+    desc = "show every debuff, ignoring the filters",
+    handler = function()
+        db.twAllAuras = not db.twAllAuras
+        ns.TankWatchLooksChanged()
+        if db.twAllAuras then
+            Print("showing |cff00ff00every debuff|r -- whoever applied it, "
+                  .. "boss aura or not. \"Boss and role debuffs only\" is "
+                  .. "overridden while this is on.")
+            Print("a short never-show list still applies (Sated, Stagger and "
+                  .. "the like); |cffffff00/tt twfilter|r drops even those.")
+        else
+            Print("back to the usual filters"
+                  .. (db.twBossAuras and " -- including boss and role debuffs "
+                      .. "only, which is on." or "."))
+        end
+    end,
+}
+
+ns.RegisterCommand{
+    name = "twtips", section = "co-tanks:", order = 60,
     desc = "toggle debuff tooltips on hover",
     handler = function()
         db.twTooltips = not db.twTooltips
@@ -840,7 +1108,7 @@ ns.RegisterCommand{
 }
 
 ns.RegisterCommand{
-    name = "twanchor", feature = "cotanks", args = "<s>", section = "co-tanks:", order = 50,
+    name = "twanchor", args = "<s>", section = "co-tanks:", order = 50,
     desc = "debuffs on the left | right",
     handler = function(_, larg)
         local a = larg and strupper(larg) or ""
@@ -855,9 +1123,24 @@ ns.RegisterCommand{
 }
 
 ns.RegisterCommand{
-    name = "cotanks", feature = "cotanks", section = "commands:", order = 50,
+    name = "cotanks", section = "commands:", order = 50,
     desc = "dump what the co-tank reads return",
     handler = DumpTanks,
+}
+
+-- Both hidden: instruments, not features.
+ns.RegisterCommand{
+    name = "twauras", hidden = true,
+    section = "co-tanks:", order = 56,
+    desc = "list every harmful aura, and what our filters would do with it",
+    handler = DumpAuras,
+}
+
+ns.RegisterCommand{
+    name = "twapi", hidden = true,
+    section = "co-tanks:", order = 58,
+    desc = "what this client's aura engine offers",
+    handler = DumpApi,
 }
 
 --------------------------------------------------------------------------------
@@ -877,9 +1160,9 @@ ns.RegisterStatusProvider(30, function(yn)
         Print("|cffff8000Panel hidden:|r fewer than " .. MinTanks()
               .. " tanks in the group. |cffffff00/tt twtest|r shows it anyway"
               .. (db.twSoloDungeon and "."
-                  or ", and |cffffff00/tt twsolo|r shows it solo in dungeons."))
+                  or ", and |cffffff00/tt twsolo|r shows it solo in an instance."))
     end
-end, "cotanks")
+end)
 
 --------------------------------------------------------------------------------
 -- Settings
@@ -887,7 +1170,7 @@ end, "cotanks")
 
 ns.RegisterOptionsSection{
     page = "Co-tanks", pageOrder = 20, column = "left", order = 10,
-    feature = "cotanks",
+   
     build = function(f, x, y)
         local ui = ns.ui
         local apply = ns.TankWatchLooksChanged
@@ -916,18 +1199,27 @@ ns.RegisterOptionsSection{
         y = ui.Slider(f, x, y, "Icon size", db, "twIconSize", 12, 40, 1, 0, apply)
         y = ui.Check(f, x, y, "Tooltip on hover", db, "twTooltips", apply)
         y = ui.Check(f, x, y, "Boss and role debuffs only", db, "twBossAuras", apply)
+        y = ui.Check(f, x, y, "Show every debuff (overrides the above)",
+                     db, "twAllAuras", apply)
 
         return ui.Note(f, x, y,
-            "Icons are drawn by the game's own aura display, which is\n"
-            .. "what lets them keep working in a boss fight -- but it\n"
-            .. "sorts by time left, not by stacks. The filter trades\n"
-            .. "a tidier row for not being able to see what it drops.")
+            "Icons are drawn by the game's own aura\n"
+            .. "display, which is what lets them keep\n"
+            .. "working in a boss fight -- but it sorts by\n"
+            .. "time left, not by stacks. The filter trades\n"
+            .. "a tidier row for not being able to see\n"
+            .. "what it drops.\n\n"
+            .. "Outside a boss encounter almost nothing\n"
+            .. "carries the boss or role flag, so the\n"
+            .. "filter above empties the row in a delve or\n"
+            .. "on a trash pull. Show every debuff is the\n"
+            .. "way back.")
     end,
 }
 
 ns.RegisterOptionsSection{
     page = "Co-tanks", pageOrder = 20, column = "right", order = 10,
-    feature = "cotanks",
+   
     build = function(f, x, y)
         local ui = ns.ui
         local apply = ns.TankWatchLooksChanged
@@ -939,7 +1231,7 @@ ns.RegisterOptionsSection{
         y = ui.Slider(f, x, y, "Panel scale", db, "twScale", 0.5, 2.0, 0.05, 2, apply)
         y = ui.Slider(f, x, y, "Hide below this many tanks", db, "twMinTanks",
                       1, 4, 1, 0, ns.RefreshTankWatch)
-        y = ui.Check(f, x, y, "...but show it solo in dungeons",
+        y = ui.Check(f, x, y, "Show even when I'm the only tank",
                      db, "twSoloDungeon", ns.RefreshTankWatch)
 
         y = ui.Button(f, x, y, "Preview panel with placeholder tanks",
@@ -950,13 +1242,18 @@ ns.RegisterOptionsSection{
             end)
 
         return ui.Note(f, x, y,
-            "Unlock the panel to drag it; the grey block is the drag\n"
-            .. "handle and disappears once locked. Preview fills it with\n"
-            .. "three copies of you so you can place it solo.\n\n"
-            .. "In a five-man you are usually the only tank, so the panel\n"
-            .. "stays hidden. Showing it solo there draws your own health\n"
-            .. "and debuffs through the same code a co-tank goes through\n"
-            .. "in a raid -- a cheap way to see what the client will and\n"
-            .. "will not hand over before it matters.")
+            "Unlock the panel to drag it; the grey block\n"
+            .. "is the drag handle and disappears once\n"
+            .. "locked. Preview fills it with three copies\n"
+            .. "of you so you can place it solo.\n\n"
+            .. "The panel answers the tank-swap question, so\n"
+            .. "it asks for two tanks. Show even when I'm the\n"
+            .. "only tank drops that to one inside a dungeon,\n"
+            .. "delve or raid -- your own health and debuffs,\n"
+            .. "drawn by exactly the code a co-tank goes\n"
+            .. "through beside you in a raid.\n\n"
+            .. "Outside an instance it changes nothing, so\n"
+            .. "you never get a panel of yourself while you\n"
+            .. "are questing.")
     end,
 }

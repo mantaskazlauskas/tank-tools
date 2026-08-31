@@ -22,6 +22,7 @@ local GetNumGroupMembers     = GetNumGroupMembers
 local GetRaidRosterInfo      = GetRaidRosterInfo
 local UnitExists             = UnitExists
 local UnitName               = UnitName
+local GetTime                = GetTime
 local twipe                  = wipe
 local strmatch               = string.match
 local tonumber               = tonumber
@@ -231,22 +232,78 @@ local INSTANCE_TYPE = {
     pvp  = true, arena = true, scenario = true,
 }
 
-ns.RegisterEvents({ "PLAYER_LOGIN", "PLAYER_ENTERING_WORLD" }, function()
+-- Where we are, read fresh. Returns whether the answer changed.
+--
+-- Validated rather than trusted, the same way RoleFor treats the roster's
+-- combat role: this is a string from a return-value list, and a consumer that
+-- compares it to "party" should read "no" from an unexpected value rather than
+-- from a nil it forgot to guard.
+--
+-- The raw string is kept beside it because that fallback is silent, and the
+-- consumer it matters to is the co-tank panel's "show me solo in instanced
+-- content" gate. Blizzard adds content types -- delves arrived reporting as
+-- "scenario", and the next one may not -- and "the panel did not appear here"
+-- is impossible to tell from "the type it reported is not one we list" unless
+-- something remembers what was actually said.
+local function ReadWorld()
+    local inInstance, instanceType = IsInInstance()
+
+    local nowIn   = inInstance and true or false
+    local nowType = INSTANCE_TYPE[instanceType] and instanceType or "none"
+    local changed = (state.inInstance ~= nowIn)
+                    or (state.instanceType ~= nowType)
+
+    state.inInstance      = nowIn
+    state.instanceType    = nowType
+    state.instanceTypeRaw = type(instanceType) == "string" and instanceType or "?"
+
+    return changed
+end
+
+-- THIS USED TO BE READ ONCE PER ZONE, AND THAT WAS WRONG
+--
+-- The old comment here said it could not change without PLAYER_ENTERING_WORLD,
+-- so reading it on that event was enough. It cannot change without one, which
+-- is not the same claim: at the *first* PEW after a transition the client will
+-- happily still describe the zone you just left. Cache that and you are wrong
+-- for the whole visit, because nothing asks again.
+--
+-- What that looked like: walk into a delve and the co-tank panel never
+-- appears, because the gate still believes you are outdoors; walk out and it
+-- stays on screen, because the gate still believes you are in a delve. A
+-- /reload fixed both, which is the tell -- the reads were fine, the cached
+-- answer was old.
+--
+-- The same window covers the other thing that is not ready when a loading
+-- screen ends: the specialization API can answer nil for a moment, and solo
+-- there is no roster event coming along later to correct it. That would leave
+-- state.isTankRole false with nothing to trigger a rebuild -- an empty tank
+-- list, and the panel hidden for exactly the same reason.
+local WORLD_SETTLE = 10    -- seconds of re-checking after a zone change
+local WORLD_EVERY  = 0.5
+local settleUntil  = 0
+
+local function RefreshAll()
     UpdateRole()
     RebuildGroupUnits()
     RebuildTankUnits()
+end
+
+ns.RegisterEvents({ "PLAYER_LOGIN", "PLAYER_ENTERING_WORLD" }, function()
+    RefreshAll()
     state.inCombat = UnitAffectingCombat("player") and true or false
+    ReadWorld()
+    settleUntil = (GetTime and GetTime() or 0) + WORLD_SETTLE
+end)
 
-    -- Read once per zone rather than per tick: it cannot change without this
-    -- event, and it gates the addon's one remaining unit-identity fallback.
-    local inInstance, instanceType = IsInInstance()
-    state.inInstance = inInstance and true or false
-
-    -- Validated rather than trusted, the same way RoleFor treats the roster's
-    -- combat role: this is a string from a return-value list, and a consumer
-    -- that compares it to "party" should read "no" from an unexpected value
-    -- rather than from a nil it forgot to guard.
-    state.instanceType = INSTANCE_TYPE[instanceType] and instanceType or "none"
+-- Registered here rather than at file scope because Core/Ticker.lua loads
+-- after this file; by PLAYER_LOGIN everything exists.
+ns.RegisterEvent("PLAYER_LOGIN", function()
+    ns.RegisterTicker("world", "world state", WORLD_EVERY, function()
+        local changed  = ReadWorld()
+        local settling = (GetTime and GetTime() or 0) < settleUntil
+        if changed or settling then RefreshAll() end
+    end)
 end)
 
 ns.RegisterEvent("PLAYER_REGEN_DISABLED", function() state.inCombat = true  end)
