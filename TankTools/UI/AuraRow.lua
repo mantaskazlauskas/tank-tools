@@ -222,7 +222,17 @@ function ui.NewAuraRow(parent)
         look     = { size = 22, max = 5, spacing = 3, grow = "RIGHT",
                      filter = "normal" },
         icons    = {},   -- fallback path only
-        buttons  = {},   -- engine path only, in the order it built them
+        -- The live container's buttons, in the order it built them. Swapped
+        -- wholesale when the row changes size, because each container has its
+        -- own set and they are not interchangeable.
+        buttons  = {},
+        -- Engine path only: { frame, buttons, wireErr } per icon size we
+        -- have built at. See UseContainer for why a row owns more than one.
+        --
+        -- Kept here rather than as fields on the container because the
+        -- container is the engine's, not ours -- the same rule the rest of
+        -- this file follows about reading one.
+        containers = {},
     }, RowMT)
 
     -- A frame of our own, not the container, and not the block. The container
@@ -467,6 +477,8 @@ local function ApplyEngineLayout(row)
 end
 
 local function BuildContainer(row)
+    local size = row.look.size
+
     local ok, c = pcall(CreateFrame, "AuraContainer", nil, row.host,
                         "CustomAuraContainerTemplate")
     if not ok or type(c) ~= "table" then
@@ -474,7 +486,14 @@ local function BuildContainer(row)
         return false
     end
 
+    -- The button list and the decoration errors from the one pass that builds
+    -- them belong to this container, not to the row: a row that has changed
+    -- size has several, and reporting the live one's buttons alongside a
+    -- retired one's failures would describe a row that does not exist.
+    local entry = { frame = c, buttons = {} }
     row.container = c
+    row.buttons   = entry.buttons
+    row.wireErr   = nil
 
     -- Anchor and size BEFORE declaring the group. The engine drains its parse
     -- and layout passes from an update armed the moment a group exists, so the
@@ -496,11 +515,76 @@ local function BuildContainer(row)
         -- diagnosable bug and a blank row.
         row.err = "AddAuraGroup: " .. tostring(err)
         row.container = nil
+        row.buttons   = {}
         c:Hide()
         return false
     end
 
+    entry.wireErr = row.wireErr
+    row.containers[size] = entry
+    -- A build that worked clears the last one that did not. Rows rebuild now,
+    -- so a stale message would outlive the failure it described.
+    row.err = nil
     return true
+end
+
+-- Point the row at a container whose buttons were built at the current icon
+-- size, making one if this size has not been used before.
+--
+-- ONE CONTAINER PER SIZE, BECAUSE A BUTTON IS SIZED EXACTLY ONCE
+--
+-- Nothing gives an AuraButton a rect but us, and the only window we get is
+-- initializeFrame -- see InitButton. The engine owns the button afterwards, so
+-- a button built at 22px is 22px for as long as it exists. SetAuraGroupLayout
+-- moves the buttons apart at the new size and does not resize them, which is
+-- what made the icon-size slider look dead: the row respaced itself around
+-- icons that never changed.
+--
+-- So the only way to icons at a new size is buttons that have never been
+-- built, which means a container that has never had any. Frames cannot be
+-- destroyed and the slider's OnValueChanged fires on every step of a drag, so
+-- the ones we finish with are kept and handed back out by the size they were
+-- built at rather than thrown away. The slider runs 12 to 40, which caps a row
+-- at one container per pixel size however long the drag -- and a drag that
+-- passes back over a size it already used allocates nothing at all.
+local function UseContainer(row)
+    local entry = row.containers[row.look.size]
+    if not entry then return BuildContainer(row) end
+
+    row.container = entry.frame
+    row.buttons   = entry.buttons
+    row.wireErr   = entry.wireErr
+    row.err       = nil
+    return true
+end
+
+-- Take the live container off screen. It stays in the by-size cache and comes
+-- back if the slider returns to the size it was built at, so this is the same
+-- shutdown a row gets when its tank leaves the group -- not a teardown.
+local function RetireContainer(row)
+    local c = row.container
+    if not c then return end
+    pcall(c.SetEnabled, c, false)
+    c:Hide()
+    row.container = nil
+end
+
+-- Show the live container what it is looking at, or nothing. Shared by the
+-- unit changing under a container and the container changing under a unit --
+-- the engine cannot tell the two apart and neither case may skip the rebind.
+local function BindContainer(row)
+    local c, unit = row.container, row.unit
+    if not c then return end
+
+    if unit then
+        pcall(c.SetUnit, c, unit)
+        pcall(c.SetEnabled, c, true)
+        c:Show()
+        pcall(c.UpdateAllAuras, c)
+    else
+        pcall(c.SetEnabled, c, false)
+        c:Hide()
+    end
 end
 
 --------------------------------------------------------------------------------
@@ -732,6 +816,7 @@ end
 -- filter ("normal"|"loose"|"none").
 function Row:Configure(look)
     local L = self.look
+    local swapped = false
     L.size     = look.size or L.size
     L.max      = look.max or L.max
     L.spacing  = look.spacing or L.spacing
@@ -742,11 +827,35 @@ function Row:Configure(look)
 
     self.host:SetSize(self:Width(), L.size)
 
-    if not self.container and HaveEngine() then
-        if BuildContainer(self) then
+    -- Everything baked into a button at build time comes off L.size -- its
+    -- rect, the duration font, the stack-count font -- so size is the one
+    -- setting that cannot be applied to the container in front of us. The
+    -- others all have a live setter below.
+    local wanted = HaveEngine() and self.containers[L.size] or nil
+    if HaveEngine() and (wanted == nil or wanted.frame ~= self.container) then
+        local was, wasButtons, wasWire = self.container, self.buttons, self.wireErr
+        RetireContainer(self)
+        if UseContainer(self) then
             -- Icons from an earlier fallback layout would otherwise sit under
             -- the container drawing the same debuffs twice.
             for i = 1, #self.icons do self.icons[i]:Hide() end
+            -- The container under this row just changed, and it has either
+            -- never been told what to look at or was told to stop looking
+            -- when it was retired. Row:SetUnit will not do it -- the unit has
+            -- not moved -- so it happens here or not at all.
+            swapped = true
+        elseif was then
+            -- A container we could not replace is worth more than none. The
+            -- alternative is the fallback path, and the fallback refuses to
+            -- read while auras are restricted -- so a build that failed
+            -- mid-fight would answer a slider nudge with an empty row for the
+            -- rest of the pull. The old one goes back on screen at the old
+            -- size: wrong by a few pixels, still drawing. row.err carries why,
+            -- and the next Configure tries again.
+            self.container = was
+            self.buttons   = wasButtons
+            self.wireErr   = wasWire
+            swapped = true
         end
     end
 
@@ -758,11 +867,7 @@ function Row:Configure(look)
         pcall(c.SetAuraGroupLayout, c, self.groupKey, o.layout)
         pcall(c.SetAuraGroupSortMethod, c, self.groupKey,
               o.sortMethod, o.sortDirection)
-        -- Buttons already built keep the size and font they were initialised
-        -- with -- the engine owns them once initializeFrame has returned, so
-        -- the icon-size slider only fully takes effect on the next reload.
-        -- The layout it lays them out with does update, so the row stays
-        -- evenly spaced in the meantime.
+        if swapped then BindContainer(self) end
     else
         ApplyFallbackLayout(self)
     end
@@ -777,16 +882,7 @@ function Row:SetUnit(unit)
     self.host:SetShown(unit ~= nil)
 
     if self.container then
-        local c = self.container
-        if unit then
-            pcall(c.SetUnit, c, unit)
-            pcall(c.SetEnabled, c, true)
-            c:Show()
-            pcall(c.UpdateAllAuras, c)
-        else
-            pcall(c.SetEnabled, c, false)
-            c:Hide()
-        end
+        BindContainer(self)
         return
     end
 
@@ -897,6 +993,14 @@ function Row:Report()
     }
 
     t.buttonAPI = self.buttonAPI
+
+    -- How many sizes this row has been through. Buttons cannot be resized
+    -- after the engine takes them, so each one left a container behind; a
+    -- number climbing past the handful of sizes the slider offers would mean
+    -- the by-size cache is not being hit.
+    local pool = 0
+    for _ in pairs(self.containers) do pool = pool + 1 end
+    t.pool = pool
 
     local c = self.container
     if c then

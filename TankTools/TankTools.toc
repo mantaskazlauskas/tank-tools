@@ -22,6 +22,10 @@
 # Features sits after DB because a flag is a saved setting like any other, and
 # before State so which modules exist is settled before anything reads the
 # world. Its window is in UI, after the widgets it is built from.
+#
+# The debuff journal is split the same way and for the same reason: the module
+# records and stores, the window in UI only draws. The window loads first and
+# calls into the module at runtime, never at file scope.
 
 Core\Namespace.lua
 Core\Secret.lua
@@ -36,7 +40,9 @@ UI\Widgets.lua
 UI\AuraRow.lua
 UI\Options.lua
 UI\Features.lua
+UI\Debuffs.lua
 
 Modules\Threat.lua
 Modules\Nameplates.lua
 Modules\TankWatch.lua
+Modules\Debuffs.lua

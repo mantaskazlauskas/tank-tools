@@ -101,6 +101,23 @@ function ns.FeatureAllows(_) return true end
 function ns.ShowFeatures() end
 function ns.ToggleFeatures() end
 
+-- UI/Debuffs.lua
+function ns.ShowDebuffs() end
+function ns.ToggleDebuffs() end
+function ns.RefreshDebuffs() end
+
+-- Modules/Debuffs.lua. An empty journal is the safe answer: the window can be
+-- built and read with the module's file removed, and shows nothing rather than
+-- erroring on the first row.
+function ns.DebuffRecords() return {} end
+function ns.DebuffDescription(_) return nil end
+function ns.ForgetDebuffs() return 0 end
+function ns.DebuffStats()
+    return { total = 0, cap = 0, recording = false, fromLog = false,
+             restricted = false, logOpen = false, sawAura = false,
+             sawLog = false }
+end
+
 -- UI/Options.lua
 function ns.ToggleOptions() end
 function ns.ShowOptions() end

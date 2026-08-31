@@ -755,9 +755,10 @@ local function DumpTanks()
                              .. "group=%s  buttons built=%d  bound=%s",
                              tostring(r.group), r.built, tostring(r.bound)))
                 Print(format("      container shown=%s rect=%s   "
-                             .. "host shown=%s   want %dx%d",
+                             .. "host shown=%s   want %dx%d   built at %d "
+                             .. "sizes",
                              r.shown, r.rect, tostring(r.hostShown),
-                             r.width, r.size))
+                             r.width, r.size, r.pool or 0))
                 Print(format("      filter: mode=%s  bossOrRoleAura=%s  max=%d",
                              tostring(r.filter), tostring(r.bossOnly), r.max))
 

@@ -315,12 +315,28 @@ function PlaySound() SOUNDS_PLAYED = SOUNDS_PLAYED + 1 end
 
 -- GameTooltip, enough of it to see what a hover asked for.
 GameTooltip = {
-    _owner = nil, _shown = false, _content = nil,
-    SetOwner = function(self, frame) self._owner = frame; self._content = nil end,
+    _owner = nil, _shown = false, _content = nil, _lines = {},
+    SetOwner = function(self, frame)
+        self._owner = frame
+        self._content = nil
+        self._lines = {}
+    end,
     IsOwned  = function(self, frame) return self._owner == frame end,
     Show     = function(self) self._shown = true end,
     Hide     = function(self) self._shown = false; self._owner = nil end,
     IsShown  = function(self) return self._shown end,
+    SetText  = function(self, text)
+        self._content = { how = "text", text = text }
+    end,
+    AddLine  = function(self, text)
+        self._lines[#self._lines + 1] = text
+    end,
+    -- Errors for a spell the client has never heard of, which is what the real
+    -- one does and what the journal window's fallback path exists for.
+    SetSpellByID = function(self, id)
+        if not SPELLDB[id] then error("no such spell: " .. tostring(id)) end
+        self._content = { how = "spell", id = id }
+    end,
     SetUnitDebuffByAuraInstanceID = function(self, unit, id)
         if id == nil then error("no aura instance id") end
         self._content = { how = "instance", unit = unit, id = id }
@@ -360,10 +376,23 @@ WORLD = {
     auraEngine   = false,   -- whether CreateFrame("AuraContainer") answers
     raidIndex    = 0,       -- our own 0-based raid slot; nil = client will not say
     raidIndexSecret = false,
+    -- Our own GUID, and whether the client will say what it is. The combat log
+    -- names a destination by GUID and nothing else, so a secret one shuts that
+    -- door completely: every line is somebody's, and none is provably ours.
+    guid         = "Player-1-TANKADIN",
+    guidSecret   = false,
+    zone         = "Elwynn Forest",
+    instanceName = "Some Instance",
     units        = {},      -- token -> { exists, isPlayer, dead, combat, threat = {by unit} }
 }
 
 function issecretvalue(v) return v == SECRET end
+
+-- A secret value a suite can hand to the addon directly. Some of what the
+-- addon reads never comes out of a Unit* call at all -- the aura tables on
+-- a UNIT_AURA payload, a combat log line -- so there has to be a way to
+-- build one of those with a field the client will not let us read.
+SECRETV = SECRET
 
 local function U(token) return WORLD.units[token] end
 
@@ -490,6 +519,14 @@ C_UnitAuras = {
             -- tooltip setter, which takes a secret as happily as a number.
             auraInstanceID = a.auraInstanceID,
             isBossAura     = a.boss,
+            -- The journal reads these three and nothing else does, which is
+            -- exactly why they are here: a stub that left them off would have
+            -- the addon reading nil where the client answers.
+            name           = a.name,
+            dispelName     = a.dispel,
+            isRaid         = a.raid and true or false,
+            -- The filter was HARMFUL, so this is not in question.
+            isHarmful      = true,
             -- Both are documented as always present on AuraData, and
             -- isFromPlayerOrPlayerPet is explicitly never secret. The row
             -- filters on it, so a stub that left it off would have the addon
@@ -540,8 +577,87 @@ C_NamePlate = {
     GetNamePlateForUnit = function(u) return NAMEPLATES[u] end,
 }
 
+--------------------------------------------------------------------------------
+-- The spell database
+--
+-- Not a unit read, so it answers in an encounter like anywhere else -- which
+-- is the whole reason the debuff journal can put a name and an icon on a
+-- record it only ever caught in the combat log. Modelled with a miss and a
+-- deferred description, because both are real: an id the client has not heard
+-- of returns nothing, and a description is empty until the data is loaded.
+--------------------------------------------------------------------------------
+
+SPELLDB = {}       -- id -> { name =, icon =, desc = }
+SPELL_REQUESTS = {}   -- ids the addon asked to have loaded
+
+C_Spell = {
+    GetSpellInfo = function(id)
+        local s = SPELLDB[id]
+        if not s then return nil end
+        return { name = s.name, iconID = s.icon, spellID = id }
+    end,
+    GetSpellDescription = function(id)
+        local s = SPELLDB[id]
+        return (s and s.desc) or ""
+    end,
+    RequestLoadSpellData = function(id)
+        SPELL_REQUESTS[#SPELL_REQUESTS + 1] = id
+    end,
+}
+
+--------------------------------------------------------------------------------
+-- The combat log
+--
+-- A different permission from a unit read, which is the point: it keeps
+-- answering where C_UnitAuras stops. One line at a time, the way the client
+-- delivers them -- the event fires and the addon asks for what is current.
+--------------------------------------------------------------------------------
+
+local LOGLINE
+
+function CombatLogGetCurrentEventInfo()
+    if not LOGLINE then return end
+    return LOGLINE[1], LOGLINE[2], LOGLINE[3], LOGLINE[4], LOGLINE[5],
+           LOGLINE[6], LOGLINE[7], LOGLINE[8], LOGLINE[9], LOGLINE[10],
+           LOGLINE[11], LOGLINE[12], LOGLINE[13], LOGLINE[14], LOGLINE[15]
+end
+
+-- destGUID defaults to us, which is the case every assertion cares about.
+function FireCombatLog(sub, spellId, spellName, auraType, destGUID)
+    LOGLINE = {
+        0, sub, false, "Creature-0-BOSS", "A Boss", 0, 0,
+        destGUID or WORLD.guid, "Tankadin", 0, 0,
+        spellId, spellName, 1, auraType or "DEBUFF",
+    }
+    FireEvent("COMBAT_LOG_EVENT_UNFILTERED")
+    LOGLINE = nil
+end
+
+function UnitGUID(u)
+    if u == "player" then
+        if WORLD.guidSecret then return SECRET end
+        return WORLD.guid
+    end
+    local d = U(u)
+    return d and d.guid or nil
+end
+
+-- Where we are, in words. Never restricted -- the zone name is on the map.
+function GetInstanceInfo()
+    return WORLD.instanceName or "Some Instance", WORLD.instanceType
+end
+
+function GetRealZoneText() return WORLD.zone or "Elwynn Forest" end
+
 TIME = 1000
 function GetTime() return TIME end
+
+-- Wall clock, which is a different thing from GetTime(): a journal record
+-- outlives the session that wrote it, so it is dated rather than stamped with
+-- seconds since some login. Driven so a suite can age a record on purpose.
+WALL = 1700000000
+function time() return WALL end
+date = os.date
 
 --------------------------------------------------------------------------------
 -- Driving
@@ -631,7 +747,7 @@ function IsSecretValue(v) return issecretvalue(v) end
 -- Total failures across every ticker the addon registered.
 function FAILED_TICKS()
     local n = 0
-    for _, name in ipairs({ "threat", "tankwatch" }) do
+    for _, name in ipairs({ "threat", "tankwatch", "debuffs" }) do
         local t = NS.GetTicker(name)
         if t then n = n + (t.failures or 0) end
     end

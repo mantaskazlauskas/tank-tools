@@ -617,14 +617,21 @@ ok(fpanel ~= nil, "features window built")
 ok(fpanel:IsShown(), "features window shown")
 ok(fpanel:GetHeight() > 0, "sized to its content: " .. tostring(fpanel:GetHeight()))
 
-local box
+-- By its label, not by position. The window draws one checkbox per registered
+-- feature in .toc order, so "the first one" is whichever module happens to
+-- declare a flag first -- which is not a fact this section is about, and which
+-- moved the day a second unfinished feature landed.
+local boxes, box = 0, nil
 for i = ctrlsBefore + 1, #NS.ui.controls do
     local c = NS.ui.controls[i]
-    if not box and c.GetObjectType and c:GetObjectType() == "CheckButton" then
-        box = c
+    if c.GetObjectType and c:GetObjectType() == "CheckButton" then
+        boxes = boxes + 1
+        local label = c:GetFontString()
+        if label and label:GetText() == "Lab rat" then box = c end
     end
 end
-ok(box ~= nil, "one checkbox per registered feature")
+eq(boxes, #NS.features, "one checkbox per registered feature")
+ok(box ~= nil, "including one for ours, found by its title")
 
 -- A real click toggles the box first, then runs OnClick.
 box:SetChecked(true)

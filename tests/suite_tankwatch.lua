@@ -497,6 +497,86 @@ end
 eq(LeadIcon(blocks[2]), first, "the leading icon does not shuffle between ticks")
 
 --------------------------------------------------------------------------------
+section("the icon size slider reaches the icons")
+--------------------------------------------------------------------------------
+
+-- The bug this section exists for: making the bars taller and then dragging
+-- "Icon size" up did nothing on screen.
+--
+-- On the engine path a button is sized exactly once, by us, inside
+-- initializeFrame -- the engine owns it from then on. SetAuraGroupLayout takes
+-- the new size and only respaces the buttons with it, so the row spread itself
+-- out around icons that stayed the size they were first built at, and the
+-- slider looked dead until a reload. The row now swaps in a container built at
+-- the new size instead.
+
+-- What every icon in the row measures, whichever path drew it.
+local function IconSizes(b)
+    local out = {}
+    if ENGINE then
+        for _, btn in ipairs(EngineButtons(b.auras)) do
+            out[#out + 1] = btn:_RawWidth() .. "x" .. btn:_RawHeight()
+        end
+    else
+        -- Only the ones on screen: icons left over from a larger cap stay
+        -- allocated at whatever size they last had, and they are hidden.
+        for _, ic in ipairs(IconsIn(b)) do
+            if ic:IsShown() then
+                out[#out + 1] = ic:GetWidth() .. "x" .. ic:GetHeight()
+            end
+        end
+    end
+    return out
+end
+
+local function AllAre(sizes, n)
+    if #sizes == 0 then return false end
+    for _, s in ipairs(sizes) do
+        if s ~= (n .. "x" .. n) then return false end
+    end
+    return true
+end
+
+local sizeBlock = blocks[2]
+local startSize = db.twIconSize
+
+db.twIconSize = 34
+NS.TankWatchLooksChanged()
+Tick(0.25)
+ok(AllAre(IconSizes(sizeBlock), 34),
+   "raising the slider resizes the icons that are up, without a reload")
+
+db.twIconSize = 16
+NS.TankWatchLooksChanged()
+Tick(0.25)
+ok(AllAre(IconSizes(sizeBlock), 16), "and lowering it resizes them back down")
+
+-- The debuffs themselves have to survive the swap. A container that changed
+-- under a bound unit is not a unit change, so nothing else would rebind it.
+ok(#IconSizes(sizeBlock) > 0, "the debuffs are still drawn after the swap")
+
+if ENGINE then
+    -- Frames cannot be destroyed and OnValueChanged fires on every step of a
+    -- drag, so retired containers are reused by the size they were built at.
+    -- Three sizes have been used here; sweeping back over them must allocate
+    -- nothing, or a slow drag would leave a frame behind per pixel.
+    local pool = sizeBlock.auras:Report().pool
+    for _, n in ipairs({ 34, 16, startSize, 34, 16 }) do
+        db.twIconSize = n
+        NS.TankWatchLooksChanged()
+        Tick(0.25)
+    end
+    eq(sizeBlock.auras:Report().pool, pool,
+       "sizes already built at are reused, not rebuilt")
+end
+
+db.twIconSize = startSize
+NS.TankWatchLooksChanged()
+Tick(0.25)
+ok(AllAre(IconSizes(sizeBlock), startSize), "and back to where the suite found it")
+eq(FAILED_TICKS(), 0, "no ticker failures across the swaps")
+
+--------------------------------------------------------------------------------
 section("aggro ring")
 --------------------------------------------------------------------------------
 

@@ -184,6 +184,63 @@ raid2  name=Bearbutt
 That last pair of lines is the whole diagnosis in one place: the read the addon
 is no longer allowed to make, and the display that is drawing anyway.
 
+## The debuff journal
+
+*Unfinished, and behind a feature flag. `/tt features` turns it on; it takes
+effect on the next `/reload`.*
+
+The co-tank panel's debuff row cannot be told what to show. The aura engine
+takes a list of spell ids to exclude and reports nothing back, so "always show
+this one, never that one" needs a list of ids — and nobody has one. The journal
+is how the list gets built: play, then read back what actually landed on you.
+
+**`/tt debuffs`** opens it. One row per spell: the icon, the name, the id, the
+dispel type, and whichever of the raid / boss / tank-role flags the client was
+willing to hand over. Hovering a row gives the game's own spell tooltip,
+description included, with what we know about it underneath. Filter by name or
+by id, sort by recency, name, or how often you have seen it.
+
+### Two doors, because one of them is shut where it matters
+
+| | What it gives | Where it works |
+|---|---|---|
+| the aura data | spell id, name, icon, dispel type, raid / boss / tank-role flags | anywhere the client will let an addon read auras |
+| the combat log | spell id, name | everywhere, including an encounter |
+
+The rich door is the one that closes. Inside an encounter or a Mythic+ the
+client refuses aura reads outright — exactly the content whose debuffs are
+worth cataloguing — so the combat log is read as well. `SPELL_AURA_APPLIED`
+carries a spell id and the word `DEBUFF`, and it is a log line rather than a
+unit read: a different permission, and one that is still open. The rest of the
+row comes from the spell database, because asking what spell 12345 is called is
+not a question about a unit and is answerable in a boss fight like anywhere
+else.
+
+What the log cannot give is the flags. A record it produced alone is marked
+**log only** rather than being drawn with five empty boxes, because "we never
+got to look" and "no, none of those" are different answers and only one of them
+is safe to act on. The same rule holds field by field: a flag read in a delve
+is never overwritten by a raid where the client refused to say.
+
+### What it costs
+
+The combat log handler runs on every line of the log, which in a raid is
+thousands a second. It rejects on the subevent first and compares a GUID only
+for the handful of lines that survive that, and it can be switched off on its
+own — **Also record from the combat log** — leaving the aura door open.
+Recording as a whole is one checkbox too.
+
+The journal holds four hundred debuffs and drops what you have not seen for
+longest. It is saved per character, and **Forget everything recorded** (or
+`/tt debuffs clear`) empties it.
+
+### What is not built yet
+
+Marking a debuff *tracked* or *ignored*, so the co-tank panel's row always
+shows it whatever else is up, or never shows it at all. That is why the feature
+is still behind a flag: the recording and the window work, and the thing they
+exist to feed does not.
+
 ## Setup
 
 Type **`/tt config`**, or go through **ESC → Options → AddOns → Tank Tools**.
@@ -330,12 +387,14 @@ typing, and for macros.
 | `/tt twlayout <l>` | tanks side by side (`row`) or stacked (`column`) |
 | `/tt twanchor <side>` | debuffs on the left / right of the bar |
 | `/tt twtips` | toggle debuff tooltips on hover |
+| `/tt debuffs` | open the debuff journal |
+| `/tt debuffs clear` | forget every recorded debuff |
 | `/tt sound` | toggle the lost-mob sound |
 | `/tt tankonly` | toggle tank-spec-only |
 
-The `tw*` rows and `/tt cotanks` exist only while the co-tank panel's feature
-flag is on. With it off they are not listed by `/tt` and do not dispatch --
-see [Features in progress](#features-in-progress).
+The `/tt debuffs` rows exist only while the debuff journal's feature flag is
+on. With it off they are not listed by `/tt` and do not dispatch -- see
+[Features in progress](#features-in-progress).
 
 ## Compatibility
 
@@ -427,6 +486,8 @@ Scenarios set up a different world before the addon loads:
 | `tankwatch:fresh` | a raid with three tanks, the co-tank flag set |
 | `tankwatch:secret` | the same raid with **every identity read restricted** |
 | `tankwatch:engine` | the same raid with an **aura display widget present and aura reads denied outright** -- a boss fight. The icons must be on screen and the addon must not have touched an aura API. |
+| `debuffs:fresh` | the journal with **both doors open** -- aura reads allowed, so a record can carry every flag there is |
+| `debuffs:secret` | the journal with **aura enumeration refused** -- the combat log has to keep it filling, and nothing may throw |
 
 The last two are the important ones, and they model two *different*
 restrictions. `WORLD.secretMode = true` makes every `Unit*` call return a secret

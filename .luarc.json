@@ -14,14 +14,18 @@
       "C_AddOns",
       "C_NamePlate",
       "C_Secrets",
+      "C_Spell",
       "C_UnitAuras",
       "C_SpecializationInfo",
+      "CombatLogGetCurrentEventInfo",
       "CreateFrame",
       "DEFAULT_CHAT_FRAME",
       "GameFontNormal",
       "GameTooltip",
+      "GetInstanceInfo",
       "GetNumGroupMembers",
       "GetRaidRosterInfo",
+      "GetRealZoneText",
       "GetSpecialization",
       "GetSpecializationRole",
       "GetTime",
@@ -62,6 +66,9 @@
       "UnitThreatSituation",
 
       "issecretvalue",
+
+      "date",
+      "time",
 
       "format",
       "strlower",
