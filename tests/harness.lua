@@ -12,6 +12,11 @@ ADDON_PATH = ADDON_DIR
 local allFrames  = {}
 local allRegions = {}
 
+-- event name -> how many times an addon asked the client to register it.
+-- Global so suites can assert on it; counted for refused attempts too, since
+-- the attempt is what the client reports as forbidden.
+EVENT_ATTEMPTS = {}
+
 -- Declared up here rather than beside WORLD because the aura widgets below
 -- hand it back from their own getters, and an upvalue has to exist before the
 -- function that closes over it.
@@ -86,6 +91,19 @@ local function NewRegion(kind, parent)
     function r:SetCooldown(start, dur) self._cd = { start, dur } end
     function r:Clear() self._cd = nil end
 
+    function r:SetAttribute(k, v)
+        -- Secure attributes are the only thing in the addon the client
+        -- refuses to let us change in combat, so they are modelled rather
+        -- than stubbed away: a suite has to be able to see that a click
+        -- target was written, and that it was not written during a pull.
+        if InCombatLockdown() then
+            error("ADDON_ACTION_BLOCKED: SetAttribute in combat", 2)
+        end
+        self._attrs = self._attrs or {}
+        self._attrs[k] = v
+    end
+    function r:GetAttribute(k) return self._attrs and self._attrs[k] end
+
     function r:SetScript(k, fn) self._scripts[k] = fn end
     function r:GetScript(k) return self._scripts[k] end
     function r:HookScript(k, fn) self._scripts[k] = fn end
@@ -109,8 +127,24 @@ local function NewRegion(kind, parent)
     end
 
     function r:RegisterEvent(e)
+        -- Every attempt is counted, refused or not. The client fires
+        -- ADDON_ACTION_FORBIDDEN on the attempt itself, so "did we ask" is the
+        -- thing worth asserting: not asking again is the entire fix for the
+        -- error report a player gets every login.
+        EVENT_ATTEMPTS[e] = (EVENT_ATTEMPTS[e] or 0) + 1
+
+        -- A protected event does NOT raise, which is the whole trap. The
+        -- client fires ADDON_ACTION_FORBIDDEN at the player's error display,
+        -- leaves the event unregistered, and returns as if it had worked --
+        -- so a caller that pcalls this and believes the result is told yes.
+        -- Modelled exactly that way, because a mock that raised would let the
+        -- broken version pass.
+        if WORLD.forbiddenEvents and WORLD.forbiddenEvents[e] then return end
         self._events = self._events or {}
         self._events[e] = true
+    end
+    function r:IsEventRegistered(e)
+        return (self._events and self._events[e]) and true or false
     end
     function r:UnregisterEvent(e)
         if self._events then self._events[e] = nil end
@@ -221,6 +255,13 @@ local function NewAuraContainer(parent)
                     local drop = f.excludeSpellIDs and a.spellId
                                  and f.excludeSpellIDs[a.spellId]
                     if f.isBossOrRoleAura and not a.boss then drop = true end
+                    -- Patch 12.1.0's includeSpellIDs, modelled here as the
+                    -- addon's own comment on it assumes: an id on this list
+                    -- is admitted past every other candidate filter above.
+                    if f.includeSpellIDs and a.spellId
+                       and f.includeSpellIDs[a.spellId] then
+                        drop = false
+                    end
                     if not drop and n < (g.max or 0) then
                         n = n + 1
                         local b = Button(g, n)
@@ -367,7 +408,11 @@ WORLD = {
     groupSize    = 0,
     spec         = 1,
     specRole     = "TANK",
+    -- Both halves of "in combat", because they are not the same question.
+    -- playerCombat is what UnitAffectingCombat answers; inCombat is the
+    -- lockdown, which is what stops a secure attribute being rewritten.
     playerCombat = false,
+    inCombat     = false,
     secretMode   = false,   -- when true, identity reads come back secret
     -- Auras are restricted differently from everything else: the client does
     -- not hand back a secret, it refuses the enumeration. Modelled as a throw,
@@ -381,9 +426,19 @@ WORLD = {
     -- door completely: every line is somebody's, and none is provably ours.
     guid         = "Player-1-TANKADIN",
     guidSecret   = false,
+    -- Event name -> true for events the client protects. Registering for one
+    -- raises, the way ADDON_ACTION_FORBIDDEN does. nil means everything is
+    -- allowed, which is every scenario that does not say otherwise.
+    forbiddenEvents = nil,
+    -- The interface version, as GetBuildInfo's fourth return. A refused combat
+    -- log is remembered against this, so bumping it is how a suite says "a
+    -- patch happened".
+    tocVersion   = 120000,
     zone         = "Elwynn Forest",
     instanceName = "Some Instance",
-    units        = {},      -- token -> { exists, isPlayer, dead, combat, threat = {by unit} }
+    -- token -> { exists, isPlayer, dead, combat, threat = {by unit},
+    --            cast = { name=, icon=, spellId=, channel=, notInterruptible= } }
+    units        = {},
 }
 
 function issecretvalue(v) return v == SECRET end
@@ -417,6 +472,8 @@ function UnitCanAttack(_, u)
     if WORLD.secretMode then return SECRET end
     return d.attackable ~= false
 end
+function InCombatLockdown() return WORLD.inCombat and true or false end
+
 function UnitAffectingCombat(u)
     if u == "player" then return WORLD.playerCombat end
     local d = U(u); if not d then return nil end
@@ -426,6 +483,26 @@ end
 function UnitThreatSituation(who, mob)
     local d = U(mob); if not d or not d.threat then return nil end
     return d.threat[who]
+end
+-- Field positions match the real API exactly (a cast carries castID, a
+-- channel does not, which shifts notInterruptible and spellID back by one),
+-- because ImportantCasts.lua reads them by position rather than reaching past
+-- them with select(). notInterruptible is the one value that goes secret
+-- under WORLD.secretMode -- the name and spellID stay plain, which is why a
+-- cast bar works at all inside an instance.
+function UnitCastingInfo(u)
+    local d = U(u); if not d or not d.cast or d.cast.channel then return nil end
+    local c = d.cast
+    local notInterruptible = c.notInterruptible or false
+    if WORLD.secretMode then notInterruptible = SECRET end
+    return c.name, "", c.icon, 0, 0, false, 1, notInterruptible, c.spellId
+end
+function UnitChannelInfo(u)
+    local d = U(u); if not d or not d.cast or not d.cast.channel then return nil end
+    local c = d.cast
+    local notInterruptible = c.notInterruptible or false
+    if WORLD.secretMode then notInterruptible = SECRET end
+    return c.name, "", c.icon, 0, 0, false, notInterruptible, c.spellId
 end
 function UnitIsUnit(a, b)
     if WORLD.secretMode then return SECRET end
@@ -603,6 +680,14 @@ C_Spell = {
     RequestLoadSpellData = function(id)
         SPELL_REQUESTS[#SPELL_REQUESTS + 1] = id
     end,
+    -- Modelled as a secret boolean under WORLD.secretMode, same as the real
+    -- client -- ImportantCasts.lua must never branch on it directly and this
+    -- is what proves that.
+    IsSpellImportant = function(id)
+        if WORLD.secretMode then return SECRET end
+        local s = SPELLDB[id]
+        return (s and s.important) and true or false
+    end,
 }
 
 --------------------------------------------------------------------------------
@@ -623,21 +708,34 @@ function CombatLogGetCurrentEventInfo()
 end
 
 -- destGUID defaults to us, which is the case every assertion cares about.
-function FireCombatLog(sub, spellId, spellName, auraType, destGUID)
+--
+-- destFlags is position 10 and carries the affiliation bits. It defaults to
+-- MINE for a line aimed at us and to RAID for one aimed at somebody else,
+-- which is what the client actually sends -- a caller that wants to model an
+-- unreadable mask passes SECRET explicitly.
+local AFFILIATION_MINE = 0x1
+local AFFILIATION_RAID = 0x4
+
+function FireCombatLog(sub, spellId, spellName, auraType, destGUID, destFlags)
+    if destFlags == nil then
+        destFlags = destGUID and AFFILIATION_RAID or AFFILIATION_MINE
+    end
     LOGLINE = {
         0, sub, false, "Creature-0-BOSS", "A Boss", 0, 0,
-        destGUID or WORLD.guid, "Tankadin", 0, 0,
+        destGUID or WORLD.guid, "Tankadin", destFlags, 0,
         spellId, spellName, 1, auraType or "DEBUFF",
     }
     FireEvent("COMBAT_LOG_EVENT_UNFILTERED")
     LOGLINE = nil
 end
 
+-- guidSecret covers every unit, not just the player. The client does not
+-- restrict our own identity and leave the rest of the raid readable, and a
+-- harness that modelled it that way would let a co-tank feature pass a suite
+-- it cannot pass in a raid.
 function UnitGUID(u)
-    if u == "player" then
-        if WORLD.guidSecret then return SECRET end
-        return WORLD.guid
-    end
+    if WORLD.guidSecret then return SECRET end
+    if u == "player" then return WORLD.guid end
     local d = U(u)
     return d and d.guid or nil
 end
@@ -648,6 +746,72 @@ function GetInstanceInfo()
 end
 
 function GetRealZoneText() return WORLD.zone or "Elwynn Forest" end
+
+--------------------------------------------------------------------------------
+-- The Encounter Journal
+--
+-- Content data rather than a unit read, so nothing here is ever secret and
+-- there is no restricted mode to model. What IS modelled is the shape that
+-- catches addons out: ENCOUNTER_START carries a *dungeon* encounter id while
+-- the journal is keyed by its own, so a lookup that confuses the two finds
+-- nothing -- and finds it silently.
+--
+-- WORLD.journal = {
+--   instance = <journalInstanceID>,
+--   encounters = { { journalID =, dungeonID =, name =, root = } },
+--   sections = { [id] = { spellID =, title =, abilityIcon =,
+--                         firstChildSectionID =, siblingSectionID = } },
+-- }
+--------------------------------------------------------------------------------
+
+function EJ_GetCurrentInstance()
+    local j = WORLD.journal
+    return j and j.instance or 0
+end
+
+-- Records what the addon selected, so a suite can assert it did NOT repoint
+-- the player's open Dungeon Journal when it did not have to.
+EJ_SELECTED = nil
+function EJ_SelectInstance(id) EJ_SELECTED = id end
+
+function EJ_GetEncounterInfoByIndex(i, instanceID)
+    local j = WORLD.journal
+    if not j then return nil end
+
+    -- A client that does not take the instance argument answers only for what
+    -- was selected. WORLD.journal.needsSelect turns that behaviour on, which
+    -- is the branch the fallback in FindEncounter exists for.
+    if j.needsSelect and instanceID ~= nil then return nil end
+    if j.needsSelect and EJ_SELECTED ~= j.instance then return nil end
+    if instanceID ~= nil and instanceID ~= j.instance then return nil end
+
+    local e = j.encounters and j.encounters[i]
+    if not e then return nil end
+    -- name, description, journalEncounterID, rootSectionID, link,
+    -- journalInstanceID, dungeonEncounterID, instanceID
+    return e.name, "", e.journalID, e.root, nil, j.instance, e.dungeonID, 0
+end
+
+C_EncounterJournal = {
+    GetSectionInfo = function(id)
+        local j = WORLD.journal
+        local s = j and j.sections and j.sections[id]
+        if not s then return nil end
+        return {
+            spellID             = s.spellID,
+            title               = s.title,
+            abilityIcon         = s.abilityIcon,
+            firstChildSectionID = s.firstChildSectionID,
+            siblingSectionID    = s.siblingSectionID,
+        }
+    end,
+}
+
+-- version, build, date, tocversion. Only the fourth is read by the addon, to
+-- date a combat log refusal so it is retried after a patch and not before.
+function GetBuildInfo()
+    return "12.1.0", "60000", "Sep  2 2026", WORLD.tocVersion
+end
 
 TIME = 1000
 function GetTime() return TIME end
@@ -747,7 +911,7 @@ function IsSecretValue(v) return issecretvalue(v) end
 -- Total failures across every ticker the addon registered.
 function FAILED_TICKS()
     local n = 0
-    for _, name in ipairs({ "threat", "tankwatch", "debuffs" }) do
+    for _, name in ipairs({ "threat", "tankwatch", "debuffs", "importantcasts" }) do
         local t = NS.GetTicker(name)
         if t then n = n + (t.failures or 0) end
     end

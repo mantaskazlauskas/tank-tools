@@ -421,10 +421,29 @@ end
 -- If icons appear on "loose" or "none", a filter was eating them and we know
 -- which. /tt twfilter walks the ladder; it is session-only and deliberately
 -- not a setting, because it is a question rather than a preference.
+--
+-- Marks -- see Modules/Debuffs.lua -- ride on top of the ladder rather than
+-- being a rung of it. An id marked ignored joins the exclude list, so it stays
+-- gone at "loose" the same way NEVER_SHOW does. An id marked important is
+-- handed to the engine as `includeSpellIDs`, a Patch 12.1.0 candidate filter
+-- documented to admit a listed aura past the other criteria rather than being
+-- narrowed by them (Warcraft Wiki, Patch 12.1.0 API changes) -- we have not
+-- yet confirmed that precedence against this row's own filters in a live
+-- raid, so if a marked debuff still is not showing, /tt twfilter is the way
+-- to check whether this is why.
 local function CandidateFilters(L)
     if L.filter == "none" then return {} end
 
-    local f = { excludeSpellIDs = NEVER_SHOW }
+    local important, ignored = ns.DebuffMarkedIDs()
+
+    local exclude = NEVER_SHOW
+    if next(ignored) then
+        exclude = {}
+        for id in pairs(NEVER_SHOW) do exclude[id] = true end
+        for id in pairs(ignored) do exclude[id] = true end
+    end
+
+    local f = { excludeSpellIDs = exclude }
     if L.filter == "loose" then return f end
 
     -- `isBossOrRoleAura` is what keeps a five-icon row from filling with procs
@@ -435,6 +454,11 @@ local function CandidateFilters(L)
     else
         f.isFromPlayerOrPlayerPet = false
     end
+
+    if next(important) then
+        f.includeSpellIDs = important
+    end
+
     return f
 end
 
@@ -609,17 +633,30 @@ local function ByStacks(a, b)
 end
 
 local function ReadAuras(unit, bossOnly)
+    local important, ignored = ns.DebuffMarkedIDs()
     local n = 0
 
     for i = 1, MAX_AURA_SCAN do
         local ok, a = pcall(C_UnitAuras.GetAuraDataByIndex, unit, i, "HARMFUL")
         if not ok or not a then break end
 
+        local id = Clean(a.spellId)
+        local marked = (type(id) == "number") and id or nil
+
         -- The engine's filter is "boss or role aura" and this one is only
         -- "boss aura" -- the narrower of the two, because it is the only flag
         -- on the data table. The paths therefore agree on what a tank cares
         -- about and can differ at the margins, which is the right way round.
-        if not (bossOnly and not Clean(a.isBossAura)) then
+        --
+        -- A mark settles it outright, in either direction, before that
+        -- question is even asked -- this path is under our control end to
+        -- end, so there is no engine precedence to guess at here the way
+        -- CandidateFilters has to.
+        local show = not (marked and ignored[marked])
+                     and ((marked and important[marked]) or
+                          not (bossOnly and not Clean(a.isBossAura)))
+
+        if show then
             n = n + 1
             local s = slots[n]
             if not s then s = {}; slots[n] = s end

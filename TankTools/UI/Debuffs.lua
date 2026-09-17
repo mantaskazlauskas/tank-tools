@@ -24,6 +24,15 @@
 -- look". A debuff caught only in the combat log has an id, a name and an icon
 -- and no flags at all, and it says so rather than drawing five empty boxes
 -- that read as five noes.
+--
+-- A ROW IS ALSO WHERE YOU SAY WHAT THE CLIENT CANNOT
+--
+-- Left-click marks a row important; right-click marks it ignored; either
+-- click again clears it. That is the whole interface -- see the row's
+-- OnMouseUp and the "important"/"ignored" chip in MetaLine. The mark itself
+-- lives on the record in Modules/Debuffs.lua, and UI/AuraRow.lua reads it back
+-- to decide what the co-tank row shows: important pins a debuff into that row
+-- even past the boss/role filter, ignored drops it from that row for good.
 --------------------------------------------------------------------------------
 
 local _, ns = ...
@@ -50,6 +59,10 @@ local rows    = {}   -- the fixed row frames, top to bottom
 local mine    = {}   -- controls this window owns, for its own refresh
 local records = {}   -- the current filtered, sorted view
 local offset  = 0
+
+-- Forward-declared: a row's click handler calls this, and rows are built
+-- before the function that draws them.
+local Redraw
 
 -- View state, session only and deliberately not saved. Which way a list is
 -- sorted while you are looking for one debuff is a question, not a preference,
@@ -78,6 +91,7 @@ local DISPEL_COLOR = {
 }
 
 local GREY = "ff808080"
+local GOLD = "ffffd100"
 
 local function Chip(text, color)
     return "|c" .. color .. text .. "|r"
@@ -103,13 +117,28 @@ local function MetaLine(r)
 
     if r.raid then parts[#parts + 1] = Chip("raid", "ffff9a3c") end
     if r.boss then parts[#parts + 1] = Chip("boss", "ffff5555") end
-    if r.tank then parts[#parts + 1] = Chip("tank", "ffffd100") end
+    if r.tank then parts[#parts + 1] = Chip("tank", GOLD) end
     if r.mine then parts[#parts + 1] = Chip("yours", GREY) end
 
     -- Never read through the aura door, so every flag above is absent rather
     -- than false. Said once, at the end, instead of five times.
-    if r.via ~= "aura" then
+    --
+    -- Three states, not two: a journal record has never been on anybody, and
+    -- calling that "log only" would claim we saw it. The distinction is the
+    -- point of the door -- one of these is a thing that happened to you and
+    -- the other is a thing the boss can do.
+    if r.via == "journal" then
+        parts[#parts + 1] = Chip("not seen yet", GREY)
+    elseif r.via ~= "aura" then
         parts[#parts + 1] = Chip("log only", GREY)
+    end
+
+    -- Your own verdict, not the client's -- last, so it reads as the last
+    -- word on the row rather than one flag among the others.
+    if r.mark == "important" then
+        parts[#parts + 1] = Chip("important", GOLD)
+    elseif r.mark == "ignored" then
+        parts[#parts + 1] = Chip("ignored", GREY)
     end
 
     return table.concat(parts, "  ")
@@ -169,14 +198,35 @@ local function ShowRowTooltip(row)
                                    r.boss and "yes" or "no",
                                    r.tank and "yes" or "no"),
                             0.6, 0.6, 0.6)
+    elseif r.via == "journal" then
+        GameTooltip:AddLine("listed as a boss ability in the Encounter Journal, "
+                            .. "which carries no flags", 0.6, 0.6, 0.6, true)
     else
         GameTooltip:AddLine("only ever seen in the combat log, which carries no "
                             .. "flags", 0.6, 0.6, 0.6, true)
     end
 
-    GameTooltip:AddLine(format("seen %d time%s%s", r.n, r.n == 1 and "" or "s",
-                              r.where and (" -- first in " .. r.where) or ""),
-                        0.6, 0.6, 0.6, true)
+    if r.n > 0 then
+        GameTooltip:AddLine(format("seen %d time%s%s", r.n, r.n == 1 and "" or "s",
+                                  r.where and (" -- first in " .. r.where) or ""),
+                            0.6, 0.6, 0.6, true)
+    else
+        -- Zero sightings is not "seen 0 times" -- it is a debuff we know about
+        -- without having met, which is the whole reason the journal door
+        -- exists. Marking one now is how you get ahead of it.
+        GameTooltip:AddLine("not seen yet -- mark it now and the co-tank row "
+                            .. "will be ready for it", 0.6, 0.6, 0.6, true)
+    end
+
+    if r.mark == "important" then
+        GameTooltip:AddLine("marked important -- always shown in the co-tank row",
+                            1, 0.82, 0)
+    elseif r.mark == "ignored" then
+        GameTooltip:AddLine("marked ignored -- never shown in the co-tank row",
+                            0.6, 0.6, 0.6)
+    end
+    GameTooltip:AddLine("left-click: toggle important   right-click: toggle ignored",
+                        0.5, 0.5, 0.5, true)
     GameTooltip:Show()
 end
 
@@ -254,6 +304,29 @@ local function CreateRow(parent, i)
     -- stopped being on screen.
     r:SetScript("OnHide", HideRowTooltip)
 
+    -- Left toggles important, right toggles ignored, either way clicking the
+    -- mark you are already on clears it. A plain Frame has no OnClick of its
+    -- own -- that is a Button concept, gated by RegisterForClicks -- so this
+    -- is OnMouseUp, which every mouse-enabled frame gets for free.
+    r:SetScript("OnMouseUp", function(self, button)
+        local rec = self._rec
+        if not rec then return end
+
+        -- Not `cond and nil or "important"` -- that idiom breaks the instant
+        -- the wanted true-branch value is nil, which toggling off always is.
+        local want
+        if button == "LeftButton" then
+            if rec.mark ~= "important" then want = "important" end
+        elseif button == "RightButton" then
+            if rec.mark ~= "ignored" then want = "ignored" end
+        else
+            return
+        end
+        ns.SetDebuffMark(rec.id, want)
+        Redraw()
+        ShowRowTooltip(self)
+    end)
+
     r:Hide()
     return r
 end
@@ -267,7 +340,7 @@ local function MaxOffset()
     return (extra > 0) and extra or 0
 end
 
-local function Redraw()
+function Redraw()
     if not panel then return end
 
     records = ns.DebuffRecords(query, view.sort)
@@ -291,6 +364,11 @@ local function Redraw()
             row.meta:SetText(MetaLine(rec))
             row.when:SetText(Ago(rec.last))
             row.count:SetText(format("%dx", rec.n))
+            -- Dimmed rather than hidden: an ignored debuff is still something
+            -- you might want to look at, revisit, or un-ignore, and a filter
+            -- that removed it from its own management screen would be the one
+            -- place in the addon where "ignored" also meant "gone".
+            row:SetAlpha(rec.mark == "ignored" and 0.45 or 1)
             row:Show()
         else
             row:Hide()
@@ -304,6 +382,7 @@ local function Redraw()
     panel.scroll._quiet = nil
 
     local s = ns.DebuffStats()
+    local important, ignored = ns.DebuffMarkCounts()
 
     panel.empty:SetShown(#records == 0)
     if #records == 0 then
@@ -313,13 +392,21 @@ local function Redraw()
             or "No debuff here matches that filter.")
     end
 
+    local marks = ""
+    if important > 0 or ignored > 0 then
+        marks = format("  --  %d important, %d ignored", important, ignored)
+    end
+
     panel.footer:SetText(format(
-        "%d recorded of %d  --  recording %s  --  aura reads here %s, combat log %s",
+        "%d recorded of %d  --  recording %s  --  aura reads here %s, combat log %s%s",
         s.total, s.cap,
         s.recording and "|cff00ff00on|r" or "|cffff4040off|r",
         s.restricted and "|cffff8000refused|r" or "|cff00ff00allowed|r",
-        (not s.logOpen) and "|cffff4040unusable|r"
-            or (s.fromLog and "|cff00ff00on|r" or "|cff808080off|r")))
+        (not s.fromLog) and "|cff808080off|r"
+            or (not s.logAllowed) and "|cffff4040refused|r"
+            or (not s.logOpen) and "|cffff4040unusable|r"
+            or "|cff00ff00on|r",
+        marks))
 
     for i = 1, #mine do
         if mine[i].Refresh then mine[i].Refresh() end
@@ -561,9 +648,23 @@ ns.RegisterCommand{
     feature = "debuffs",
     section = "debuffs:",
     order   = 10,
-    args    = "[clear]",
+    args    = "[clear|log]",
     desc    = "the debuff journal -- everything that has landed on you",
     handler = function(_, larg)
+        if larg == "log" then
+            -- Asking again after a refusal was remembered. Says which answer
+            -- it got, because the whole point of the memory is that the
+            -- question stops being asked silently.
+            if ns.RetryDebuffLog() then
+                ns.Print("the combat log door is |cff00ff00open|r.")
+            else
+                ns.Print("the client still |cffff4040refuses|r the combat log. "
+                         .. "The journal records through the aura door only, "
+                         .. "which is shut inside encounters.")
+            end
+            ns.RefreshDebuffs()
+            return
+        end
         if larg == "clear" then
             local n = ns.ForgetDebuffs()
             ns.Print(format("forgot %d recorded debuff%s.", n, n == 1 and "" or "s"))
@@ -592,19 +693,42 @@ ns.RegisterOptionsSection{
 
         y = ui.Header(f, "Debuff journal", x, y)
         y = ui.Note(f, x, y,
-            "Every debuff that lands on you is written down once,\n"
-            .. "with whatever the client would say about it.")
+            "Every debuff that lands on you or a co-tank is written\n"
+            .. "down once, with whatever the client would say about it.")
         y = y - 6
 
         y = ui.Check(f, x, y, "Record debuffs", store, "djRecord")
-        y = ui.Check(f, x, y, "Also record from the combat log", store, "djFromLog")
+        -- Switching it on has to ask the client, because OnInit did not: the
+        -- registration is skipped entirely while this is off, so without this
+        -- the setting would look on and record nothing until a reload.
+        y = ui.Check(f, x, y, "Also record from the combat log", store,
+                     "djFromLog", function()
+            if store.djFromLog then ns.RetryDebuffLog() end
+            ns.RefreshDebuffs()
+        end)
         y = ui.Note(f, x + 24, y + 4,
-            "The combat log is the only door open in an encounter,\n"
-            .. "but it carries a spell id and nothing else -- no\n"
-            .. "dispel type and no raid or boss flags.", ui.COL_W - 24)
+            "The other door in an encounter, where the client allows\n"
+            .. "it at all -- some refuse to register for the combat log.\n"
+            .. "It carries a spell id and nothing else: no dispel type\n"
+            .. "and no raid or boss flags. /tt status says which doors\n"
+            .. "are open here.", ui.COL_W - 24)
+
+        y = ui.Check(f, x, y, "Also learn boss abilities at the pull", store,
+                     "djFromJournal", function() ns.RefreshDebuffs() end)
+        y = ui.Note(f, x + 24, y + 4,
+            "Reads the Encounter Journal's ability list when a boss\n"
+            .. "is pulled, so its debuffs are in the list before they\n"
+            .. "ever land on anyone -- the only door that does not care\n"
+            .. "who was hit. Those rows show as 'not seen yet' until\n"
+            .. "one actually turns up on you or a co-tank.",
+            ui.COL_W - 24)
 
         y = y - 6
         y = ui.Button(f, x, y, "Open the journal", function() ns.ShowDebuffs() end)
+        y = ui.Note(f, x, y,
+            "In the journal, left-click a debuff to mark it\n"
+            .. "important -- always shown in the co-tank row -- or\n"
+            .. "right-click to mark it ignored -- never shown there.")
 
         return y
     end,

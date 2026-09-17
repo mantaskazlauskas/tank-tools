@@ -30,9 +30,13 @@ ADDON = (HERE.parent / "TankTools").as_posix()
 
 # suite file -> scenarios it should be run under
 SUITES = {
-    "core":      ["fresh", "migrate", "tabs"],
-    "tankwatch": ["fresh", "secret", "engine"],
-    "debuffs":   ["fresh", "secret"],
+    "core":            ["fresh", "migrate", "tabs"],
+    "tankwatch":       ["fresh", "secret", "engine"],
+    "debuffs":         ["fresh", "secret"],
+    # A client that protects COMBAT_LOG_EVENT_UNFILTERED: refused for the first
+    # time, and refused in an earlier session and remembered.
+    "debuffs_log":     ["refused", "remembered"],
+    "importantcasts":  ["fresh", "secret"],
 }
 
 # A v1 (flat) saved-variables table, as it existed before the module split.

@@ -29,11 +29,12 @@ WORLD.aurasSecret = ENGINE
 -- Boss auras by default: the panel filters to boss and role debuffs out of the
 -- box, because the aura engine cannot be asked to sort by stacks and a row
 -- full of procs would push the tank debuff off the end.
-local function Aura(icon, stacks, dur, remaining, boss)
+local function Aura(icon, stacks, dur, remaining, boss, spellId)
     return {
         icon = icon, applications = stacks, duration = dur,
         expirationTime = remaining and (GetTime() + remaining) or nil,
         boss = (boss ~= false),
+        spellId = spellId,
     }
 end
 
@@ -287,7 +288,7 @@ if ENGINE then
 
     -- The boss/role filter is off by default -- deliberately, because the
     -- engine never reports what it dropped -- so a proc is shown.
-    WORLD.units["raid2"].auras[5] = Aura("proc", nil, 8, 4, false)
+    WORLD.units["raid2"].auras[5] = Aura("proc", nil, 8, 4, false, 90001)
     FireEvent("UNIT_AURA", "raid2")
     Tick(0.25)
     eq(#EngineButtons(row), 5, "everything harmful is shown out of the box")
@@ -298,7 +299,26 @@ if ENGINE then
     Tick(0.25)
     eq(#EngineButtons(row), 4, "the filter drops a non-boss proc when asked")
 
+    -- A debuff marked important (Modules/Debuffs.lua) is handed to the engine
+    -- as includeSpellIDs and stays visible past the very filter that just
+    -- dropped it -- the whole reason to mark one. Substituted here rather
+    -- than switching the debuffs feature on for this suite: this is the exact
+    -- boundary UI/AuraRow.lua's CandidateFilters is written against, and the
+    -- journal's own storage is already covered in suite_debuffs.lua.
+    local savedMarks = NS.DebuffMarkedIDs
+    NS.DebuffMarkedIDs = function() return { [90001] = true }, {} end
+    NS.TankWatchLooksChanged()
+    Tick(0.25)
+    eq(#EngineButtons(row), 5, "marking it important pins it past the boss filter")
+
+    -- The other direction: ignored drops it even with the filter back off.
     NS.GetModule("tankwatch").db.twBossAuras = false
+    NS.DebuffMarkedIDs = function() return {}, { [90001] = true } end
+    NS.TankWatchLooksChanged()
+    Tick(0.25)
+    eq(#EngineButtons(row), 4, "marking it ignored drops it even with the filter off")
+
+    NS.DebuffMarkedIDs = savedMarks
     NS.TankWatchLooksChanged()
     Tick(0.25)
     WORLD.units["raid2"].auras[5] = nil
@@ -784,9 +804,10 @@ section("settings page")
 --------------------------------------------------------------------------------
 
 NS.ShowOptions()
-eq(#NS.optionsPages, 2, "the module added a second settings page")
+eq(#NS.optionsPages, 3, "the module added a second settings page, and importantcasts a third")
 eq(NS.optionsPages[1].name, "Threat",   "threat page first")
 eq(NS.optionsPages[2].name, "Co-tanks", "co-tank page second")
+eq(NS.optionsPages[3].name, "Casts",    "important-cast page third")
 ok(NS.optionsPages[1].tab ~= nil, "a tab strip appeared")
 ok(NS.optionsPages[2].tab ~= nil, "both tabs built")
 
@@ -1234,6 +1255,141 @@ if not ENGINE then
     Tick(0.25)
     ok(blocks[1].auras:IsEngine(), "and the row moves onto it without a reload")
 end
+
+--------------------------------------------------------------------------------
+section("hover-casting")
+--
+-- The bars are unit frames or they are decoration. What makes them one is a
+-- secure button carrying the unit a click lands on -- and the client will not
+-- let that attribute be written in combat, which is the whole difficulty here.
+--
+-- The harness models exactly that: SetAttribute throws during a pull, the way
+-- ADDON_ACTION_BLOCKED does. So these sections are as much about what the
+-- addon does *not* do -- a suite that stays quiet through a roster change
+-- mid-fight is a suite proving the panel never asked.
+--------------------------------------------------------------------------------
+
+db.twEnabled   = true
+db.twHoverCast = true
+WORLD.inCombat = false
+BuildRaid()
+FireEvent("GROUP_ROSTER_UPDATE")
+Tick(0.25)
+
+local function HoverOf(b)
+    for _, f in ipairs(FramesParentedTo(b)) do
+        if f._template == "SecureUnitButtonTemplate" then return f end
+    end
+end
+
+local live = FramesParentedTo(panel)
+local h1, h2 = HoverOf(live[1]), HoverOf(live[2])
+
+ok(h1 ~= nil, "the first bar carries a secure button")
+ok(h2 ~= nil, "and so does the second")
+eq(h1._type, "Button", "it is a button, so a click has somewhere to land")
+eq(h1:GetAttribute("unit"), "raid1", "wired to the tank that bar is drawing")
+eq(h2:GetAttribute("unit"), "raid2", "and the co-tank's bar to the co-tank")
+eq(h1:GetAttribute("*type1"), "target", "left-click targets")
+eq(h1:GetAttribute("*type2"), "togglemenu", "right-click opens the unit menu")
+ok(_G.ClickCastFrames and _G.ClickCastFrames[h1],
+   "registered where Clique and the rest look for click-cast frames")
+
+-- Unit tokens are not identity and are never secret, which is why this whole
+-- feature survives an instance at all: what goes into the attribute is the
+-- same plain string in a raid as it is in Elwynn.
+if SECRETS then
+    eq(h2:GetAttribute("unit"), "raid2",
+       "a restricted client changes nothing -- the token is not a secret")
+end
+
+--------------------------------------------------------------------------------
+section("a pull cannot rewire a bar, so the panel stops trying")
+--------------------------------------------------------------------------------
+
+local quiet = #CHAT
+WORLD.inCombat = true
+WORLD.units["raid2"] = nil               -- the co-tank leaves mid-fight
+FireEvent("GROUP_ROSTER_UPDATE")
+Tick(0.25)
+
+eq(#NS.tankUnits, 2, "two tanks left")
+eq(h2:GetAttribute("unit"), "raid2",
+   "the click target still names the tank who left; it cannot be rewritten")
+eq(live[2]._alpha, 0.45,
+   "so that bar is drawn faded rather than quietly pointing somewhere else")
+eq(live[1]._alpha, 1, "the bar whose occupant did not change is untouched")
+
+local ticker = NS.GetTicker("tankwatch")
+ok(ticker and not ticker.disabled, "nothing was blocked: the panel is still running")
+eq(#ChatSince(quiet), 0, "and nothing was printed, because nothing went wrong")
+
+--------------------------------------------------------------------------------
+section("and it catches up the moment the pull ends")
+--------------------------------------------------------------------------------
+
+WORLD.inCombat = false
+Tick(0.25)
+
+eq(h2:GetAttribute("unit"), "raid5", "the bar's click target is the tank it draws")
+eq(live[2]._alpha, 1, "and it is drawn at full alpha again")
+
+--------------------------------------------------------------------------------
+section("in combat a tank keeps the bar they are already in")
+--
+-- Out of combat the panel sorts into roster order. In combat it must not: a
+-- bar that swapped occupant would be a bar whose button still names the last
+-- one. So whoever is on screen stays put and a newcomer takes what is left.
+--------------------------------------------------------------------------------
+
+WORLD.inCombat = true
+BuildRaid()                              -- raid2 comes back mid-fight
+FireEvent("GROUP_ROSTER_UPDATE")
+Tick(0.25)
+
+live = FramesParentedTo(panel)
+eq(#live, 3, "three bars again")
+eq(h2:GetAttribute("unit"), "raid5", "the bar raid5 was in is still raid5's")
+eq(live[2]._alpha, 1, "so it is still trustworthy")
+
+-- The third bar is a recycled one, so it is not blank -- it still names the
+-- tank it was wired to before the roster moved. That is the dangerous shape
+-- this whole design is built around: a bar drawing raid2 over a button that
+-- would cast on raid5, with no way to fix it until the pull ends.
+local h3 = HoverOf(live[3])
+ok(h3 ~= nil and h3:GetAttribute("unit") ~= "raid2",
+   "the tank who joined mid-pull could not be wired up")
+eq(live[3]._alpha, 0.45, "so their bar is faded rather than guessing")
+
+WORLD.inCombat = false
+Tick(0.25)
+
+live = FramesParentedTo(panel)
+eq(HoverOf(live[2]):GetAttribute("unit"), "raid2",
+   "the panel re-sorts into roster order once the fight is over")
+eq(HoverOf(live[3]):GetAttribute("unit"), "raid5",
+   "and every bar is wired to the tank it is drawing")
+eq(live[3]._alpha, 1, "nothing is left faded")
+
+--------------------------------------------------------------------------------
+section("turning it off gives the mouse back")
+--------------------------------------------------------------------------------
+
+Slash("twhover")
+Tick(0.25)
+eq(db.twHoverCast, false, "/tt twhover turns it off")
+eq(h1:GetAttribute("unit"), nil, "the bar releases its click target")
+ok(not h1:IsShown(), "and the button stops taking the mouse")
+
+Slash("twhover")
+Tick(0.25)
+eq(h1:GetAttribute("unit"), "raid1", "and back on again")
+
+local hoverHelp = Said("")
+ok(hoverHelp:find("twhover") ~= nil, "twhover is listed like any other feature")
+
+local hoverStatus = Said("status")
+ok(hoverStatus:find("hover%-cast") ~= nil, "and /tt status says whether it is wired")
 
 WORLD.secretMode = false
 report()

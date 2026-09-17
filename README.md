@@ -9,7 +9,7 @@ dependencies, no embedded libraries, works on the default UI.
 
 ## What it does
 
-Two questions, answered as fast as possible.
+Three questions, answered as fast as possible.
 
 **Which enemy is on someone else, so I can taunt it off?**
 
@@ -19,6 +19,12 @@ meter, no list, no percentages — see
 [Secret values](#secret-values-midnight-and-later) for why those cannot work
 inside an instance, and why none of them is what a tank acts on anyway.
 
+**Which enemy just started something worth reacting to?**
+
+A second, differently-shaped glyph (`!!` by default) appears over any enemy
+nameplate casting a spell the game itself flags important, plus a sound. See
+[The important-cast marker](#the-important-cast-marker).
+
 **How many stacks does the other tank have, and is it my turn?**
 
 A small panel puts you and your co-tanks side by side — health, boss debuffs
@@ -26,7 +32,8 @@ with their stack counts, and a ring around whoever is currently holding the
 boss. The debuffs are drawn by the game's own aura display, which is what keeps
 them on screen inside an encounter. See [The co-tank panel](#the-co-tank-panel).
 
-Both are optional and independent; turn either off and the other is untouched.
+All three are optional and independent; turn any one off and the others are
+untouched.
 
 ## The three markers
 
@@ -69,6 +76,32 @@ Every one of those survives being rendered in pure grayscale. Color is
 decoration applied last — turn the monitor monochrome and the marker still
 works perfectly. Every state is a differently *shaped* glyph, never a recolored
 one, so no two ever rely on being told apart by hue.
+
+## The important-cast marker
+
+A second glyph, independent of the threat markers above and on by default: it
+appears over any enemy nameplate casting something the game itself flags
+important, plus a sound.
+
+**"Important" is not a spell list this addon keeps.** It is read straight from
+`C_Spell.IsSpellImportant`, the same flag the default UI uses to ring a boss's
+cast bar — an addon that curated its own list of "spells worth interrupting"
+would need updating every tier, and would disagree with the game's own UI the
+moment it fell behind. Riding the game's own flag means the marker never goes
+stale, and always agrees with what the boss's own cast bar is telling everyone
+else in the group.
+
+It uses a different default symbol (`!!`), color and position (top of the
+plate, rather than the aggro marker's left) than the three threat markers, so
+the two can be read apart at a glance when they land on the same nameplate at
+once. Every knob the aggro marker has — size, position, symbol, color, pulse —
+exists here too, under its own **Casts** tab in the settings window.
+
+Unlike the threat scan, this does not track "still casting" across a gap: a
+cast either exists on a unit right now or it does not, so the marker is on
+exactly while `UnitCastingInfo`/`UnitChannelInfo` say a cast is running and the
+game agrees it is important — nothing is remembered between one and the next.
+The sound fires once per cast, not once per poll.
 
 ## The co-tank panel
 
@@ -116,6 +149,10 @@ which of you is actually holding the boss.
   display supplies it, which is the only way to get one for an aura the addon
   is not allowed to identify. `/tt twtips` turns it off if you would rather the
   icons not take the mouse at all.
+- **Hover a bar to cast on that tank.** The bars are real unit frames, so a
+  `[@mouseover]` macro lands on whoever the cursor is over, left-click targets
+  and right-click opens the unit menu. See
+  [Hover-casting](#hover-casting).
 - Absorbs draw on top of the health fill, never past it -- a shielded tank at
   40% is not a tank at 60%.
 
@@ -129,6 +166,42 @@ client will actually hand over -- your own bar goes through the same reads and
 the same setters a co-tank's does in a raid, so debuffs that render on you there
 will render on them when it matters. It applies to party instances only, so the
 panel does not follow you into the open world or a battleground.
+
+### Hover-casting
+
+A co-tank panel you can only read is one you end up reading instead of using.
+The tank-swap question it answers -- *how many stacks do they have, is it my
+turn* -- is almost always followed by doing something about it, so the bars are
+unit frames rather than pictures of them:
+
+```
+/cast [@mouseover,help,nodead][] Blessing of Sacrifice
+```
+
+Point at a bar, press the key, and it lands on that tank. Left-click targets
+them, right-click opens the unit menu. The bars register themselves with
+`ClickCastFrames`, so Clique and anything else that binds click-casts picks
+them up without being told.
+
+`/tt twhover` turns the whole thing off, and there is a checkbox beside it in
+the settings window. The reason it is a setting at all: while it is on the bars
+take the mouse, so clicks over them stop falling through to the world behind.
+Dragging still works when the panel is unlocked -- the button forwards the drag
+rather than swallowing it.
+
+**A faded bar means look, do not click.** A secure button is the one thing in
+the addon the client will not let it change during a fight, and what cannot be
+changed is the unit a click lands on. So if the roster moves mid-pull and a bar
+ends up drawing somebody its button was not wired to, the panel does not guess:
+that bar is drawn at half alpha until the fight ends, and then it fixes itself
+on the next tick. `/tt status` counts how many bars are wired and how many are
+waiting.
+
+Most of the time it never comes up, because in combat the panel stops sorting.
+Each tank keeps the bar their button already names and only the leftovers move,
+so the bar and the click agree by construction; roster order comes back the
+moment the pull is over. That also stops the panel reshuffling under your
+cursor mid-fight, which is worth having on its own.
 
 ### Why it survives Midnight
 
@@ -192,7 +265,10 @@ effect on the next `/reload`.*
 The co-tank panel's debuff row cannot be told what to show. The aura engine
 takes a list of spell ids to exclude and reports nothing back, so "always show
 this one, never that one" needs a list of ids — and nobody has one. The journal
-is how the list gets built: play, then read back what actually landed on you.
+is how the list gets built: play, then read back what actually landed — on you
+or on the tank standing next to you. Both, because the row it exists to feed
+draws the *other* tank's debuffs, and a journal that only ever saw your own
+could never offer you the icon you watched all night and wanted to pin.
 
 **`/tt debuffs`** opens it. One row per spell: the icon, the name, the id, the
 dispel type, and whichever of the raid / boss / tank-role flags the client was
@@ -200,12 +276,13 @@ willing to hand over. Hovering a row gives the game's own spell tooltip,
 description included, with what we know about it underneath. Filter by name or
 by id, sort by recency, name, or how often you have seen it.
 
-### Two doors, because one of them is shut where it matters
+### Three doors, because the first is shut where it matters
 
 | | What it gives | Where it works |
 |---|---|---|
 | the aura data | spell id, name, icon, dispel type, raid / boss / tank-role flags | anywhere the client will let an addon read auras |
 | the combat log | spell id, name | everywhere, including an encounter |
+| the Encounter Journal | spell id, name, icon — for the boss's whole ability list | everywhere, and **before anything lands** |
 
 The rich door is the one that closes. Inside an encounter or a Mythic+ the
 client refuses aura reads outright — exactly the content whose debuffs are
@@ -222,13 +299,76 @@ got to look" and "no, none of those" are different answers and only one of them
 is safe to act on. The same rule holds field by field: a flag read in a delve
 is never overwritten by a raid where the client refused to say.
 
+### The third door does not care who was hit
+
+The other two record what **landed**. The Encounter Journal records what the
+boss **can do**, which is a different fact and kept apart from the first two.
+
+It works in an encounter for the same reason the spell database does: the
+Dungeon Journal is the game's own content data, not an answer about a unit, so
+nothing about it is restricted. That makes it the only door that stays open
+regardless of whose health bar the debuff appeared over — which is exactly the
+gap the other two leave, since one needs aura reads and the other needs an
+identity to attribute a log line to.
+
+At `ENCOUNTER_START` the boss's ability sections are walked and every spell id
+on them is written down, marked **not seen yet** and with no sighting count.
+Meeting one for real upgrades the record in place. You can mark a debuff
+important *before the pull*, which is the thing none of the other doors can
+offer.
+
+One trap worth naming, because it fails silently: `ENCOUNTER_START` carries a
+**dungeon** encounter id and the journal is keyed by its own **journal**
+encounter id. They are different numbers for the same boss, and feeding one to
+the other's API simply returns nothing — so the id is mapped by walking the
+current instance's encounters. The lookup also avoids `EJ_SelectInstance`
+wherever the client will take an instance argument directly: silently
+repointing the Dungeon Journal a player has open is not a reasonable price for
+looking up a spell id.
+
+Never-seen entries are also the first to be dropped when the journal fills.
+Something that actually landed on you is the better record by definition, and
+it should not be evicted to keep a guess about a boss you never fought.
+
+### Whose debuffs, and how each one is recognised
+
+Recognising a log line is a separate problem from reading it, and it is the one
+that used to shut the log door in a raid. `UnitGUID("player")` is a secret
+inside an instance, so matching the line's destination against our own GUID
+could never succeed — both doors closed at once, in exactly the content the
+second door exists for.
+
+The affiliation bits on the line solve it for you. `destFlags` is a bitmask on
+a log line rather than an answer about a unit — the same permission that lets
+the log be read at all — and it says **mine** without anybody's identity being
+involved.
+
+| | Recognised by | Works in an encounter |
+|---|---|---|
+| your own debuffs | the `MINE` affiliation bit | **yes** |
+| a co-tank's | a GUID match against the tank roster | no |
+
+The mask distinguishes mine / party / raid and has **no notion of role**, so
+"is this line about a tank" is precisely the question it cannot answer — and a
+GUID is what an encounter takes away. Co-tank recording therefore works
+wherever the client still names people, and stops inside an encounter.
+
+That is stated rather than hidden: **`/tt status`** prints how many co-tanks
+were recognised and how many the client would not name, so a raid night that
+ends with none of the other tank's debuffs has a printed reason rather than
+looking like a feature that forgot to run.
+
 ### What it costs
 
 The combat log handler runs on every line of the log, which in a raid is
-thousands a second. It rejects on the subevent first and compares a GUID only
-for the handful of lines that survive that, and it can be switched off on its
-own — **Also record from the combat log** — leaving the aura door open.
-Recording as a whole is one checkbox too.
+thousands a second. It rejects on the subevent first and attributes a line only
+for the handful that survive that — arithmetic on a mask it already has, before
+any GUID lookup — and it can be switched off on its own — **Also record from
+the combat log** — leaving the aura door open. Recording as a whole is one
+checkbox too.
+
+Co-tanks add one aura walk per tank, rate limited to once a second and skipped
+entirely wherever aura reads are refused.
 
 The journal holds four hundred debuffs and drops what you have not seen for
 longest. It is saved per character, and **Forget everything recorded** (or
@@ -337,6 +477,19 @@ it reach a comparison. Identity predicates then **fail open**: an unreadable
 threat data does the real gating and you cannot hold threat on a friendly unit.
 Failing closed is what blinds the addon in exactly the content it exists for.
 
+### The important-cast flag can be secret too
+
+`UnitCastingInfo`/`UnitChannelInfo` themselves stay readable inside an
+instance — a cast bar has to work in a dungeon, so the name, icon and spell ID
+are never restricted. But `C_Spell.IsSpellImportant`'s answer can come back a
+secret boolean, the same as any other identity-adjacent read.
+
+That is handled through the same `Clean()`/`IsTrue()` door as everything else,
+but in the **opposite** direction from the identity gates above: an unreadable
+answer here means **no marker, no sound**, not "let it through". The important-
+cast marker is a decorative alert, not a check that would blind the addon to a
+real mob if it failed the other way — so it fails closed instead of open.
+
 ### What this costs inside instances
 
 One thing genuinely cannot be done there: asking a mob **who it is currently
@@ -387,10 +540,19 @@ typing, and for macros.
 | `/tt twlayout <l>` | tanks side by side (`row`) or stacked (`column`) |
 | `/tt twanchor <side>` | debuffs on the left / right of the bar |
 | `/tt twtips` | toggle debuff tooltips on hover |
+| `/tt twhover` | toggle hover-casting on the bars |
 | `/tt debuffs` | open the debuff journal |
 | `/tt debuffs clear` | forget every recorded debuff |
 | `/tt sound` | toggle the lost-mob sound |
 | `/tt tankonly` | toggle tank-spec-only |
+| `/tt ictest` | preview the important-cast symbol on every nameplate |
+| `/tt ic` | toggle the important-cast marker |
+| `/tt icsound` | toggle the important-cast sound |
+| `/tt icpulse` | toggle its pulse |
+| `/tt icsize <10-72>` | its size |
+| `/tt icanchor <pos>` | left / right / top / bottom |
+| `/tt icglyph <text>` | its symbol (default `!!`) |
+| `/tt iccolor <name>` | its color, same presets as the threat markers |
 
 The `/tt debuffs` rows exist only while the debuff journal's feature flag is
 on. With it off they are not listed by `/tt` and do not dispatch -- see
@@ -400,8 +562,9 @@ on. With it off they are not listed by `/tt` and do not dispatch -- see
 
 Tank Tools is self-contained. It has no required dependencies, embeds no
 libraries, ships no custom media, and uses only documented Blizzard APIs
-(`C_NamePlate`, the `nameplate1`…`nameplate40` unit tokens, and
-`UnitThreatSituation`). It works as-is on the default UI.
+(`C_NamePlate`, the `nameplate1`…`nameplate40` unit tokens,
+`UnitThreatSituation`, `UnitCastingInfo`/`UnitChannelInfo`, and
+`C_Spell.IsSpellImportant`). It works as-is on the default UI.
 
 It also composes with nameplate addons rather than competing with them. The
 marker is a child frame of Blizzard's base nameplate container and never
@@ -429,6 +592,8 @@ setup.
   recycles a small fixed pool of plates, so a whole session allocates ~40.
 - Markers only touch a frame on an actual state transition. In a big pull the
   steady state is a couple of comparisons per plate per tick.
+- The important-cast scan polls its own 5 Hz ticker, independent of the threat
+  scan, and shares the same marker-frame-per-plate allocation strategy.
 
 ## Development
 
@@ -453,6 +618,7 @@ tank-tools/
       Threat.lua             the scan -- produces state, draws nothing
       Nameplates.lua         the markers themselves
       TankWatch.lua          the co-tank panel
+      ImportantCasts.lua     the important-cast marker -- polls, marks, sounds
   tests/                      loads the addon into real Lua 5.1, no WoW needed
   assets/                     logo + the script that renders it (not shipped)
   deploy.py                   copy into a live WoW install for testing

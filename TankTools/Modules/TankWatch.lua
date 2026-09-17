@@ -53,6 +53,7 @@ local GetRaidRosterInfo   = GetRaidRosterInfo
 local GetNumGroupMembers  = GetNumGroupMembers
 local IsInRaid            = IsInRaid
 local GetTime             = GetTime
+local InCombatLockdown    = InCombatLockdown
 local twipe               = wipe
 local floor               = math.floor
 local format              = string.format
@@ -115,6 +116,18 @@ local M = ns.NewModule("tankwatch", {
         twShowPercent = true,
         twAggroRing   = true,    -- ring the tank who is holding a boss
         twTooltips    = true,    -- hover a debuff icon for its tooltip
+        -- Makes the bars real unit frames: @mouseover resolves to whoever the
+        -- cursor is over, so a hover-cast macro lands on a co-tank without
+        -- hunting down their raid frame. Left-click targets, right-click opens
+        -- the unit menu, the same as every other unit frame in the game.
+        --
+        -- On by default. A co-tank panel you can only read is one you end up
+        -- reading instead of using, and the tank-swap question it answers is
+        -- almost always followed by doing something about it.
+        --
+        -- The cost, and the reason it is a setting at all: the bars now take
+        -- the mouse, so clicks over them stop falling through to the world.
+        twHoverCast   = true,
         -- twPoint is deliberately absent: an unset position means "centre",
         -- and it is written as a whole table the first time the panel is
         -- dragged. A default here would have to be a table with string keys,
@@ -210,6 +223,134 @@ local function CreateBlock(index)
     b:Hide()
     blocks[index] = b
     return b
+end
+
+--------------------------------------------------------------------------------
+-- Dragging
+--
+-- Shared, because once the bars take the mouse the panel's own frame is no
+-- longer the thing under the cursor and the hover button has to forward the
+-- drag rather than fight it for the click.
+--------------------------------------------------------------------------------
+
+local function StartDrag()
+    if not db.twLocked then frame:StartMoving() end
+end
+
+local function StopDrag()
+    frame:StopMovingOrSizing()
+    local point, _, relPoint, x, y = frame:GetPoint()
+    db.twPoint = { point, relPoint, x, y }
+end
+
+--------------------------------------------------------------------------------
+-- Hover-casting
+--
+-- What turns a drawn bar into a *unit frame*: somewhere @mouseover resolves,
+-- so "/cast [@mouseover] Blessing of Sacrifice" lands on the tank the cursor
+-- is over. That takes a secure button, and the secure button is the one thing
+-- in this module that cannot be driven from the tick.
+--
+-- Everything about it is protected in combat: creating it, pointing it,
+-- showing it, and above all writing the unit attribute that decides who a
+-- click lands on. A panel that rebuilt itself five times a second would be
+-- throwing "action blocked" from the first pull onwards.
+--
+-- So the secure half is deliberately the slow half:
+--
+--   * created once per block and never re-pointed. SetAllPoints on the bar
+--     means it follows every relayout for free -- an anchor moving is not an
+--     API call, so the size sliders keep working in combat.
+--   * Show()n once. Visibility stays the block's job, and hiding a plain
+--     parent hides a protected child without touching the protected frame.
+--   * only the unit attribute ever changes, and only when the occupant does.
+--
+-- WHEN THE BAR AND THE BUTTON DISAGREE
+--
+-- That leaves the case the client genuinely will not allow: the roster
+-- changing mid-pull, when the attribute cannot be rewritten and the block is
+-- drawing somebody new. A bar showing Pucks over a button that still casts on
+-- Tuubbyy is the one failure here that gets somebody killed, so it is not
+-- papered over.
+--
+-- Two things keep it rare and visible. AssignBlocks below stops blocks
+-- swapping occupants in combat at all, which removes nearly every instance of
+-- it; and a block whose button is out of step is drawn at half alpha, which
+-- reads as "do not trust this one" through the same presence channel the
+-- nameplate glyphs use. Both resolve themselves the moment the pull ends,
+-- because the tick is already asking.
+--------------------------------------------------------------------------------
+
+-- Latched, not retried. If this client has no SecureUnitButtonTemplate the
+-- answer will not change before a reload, and a failed CreateFrame five times
+-- a second is how the panel stops being about co-tanks.
+local hoverBroken = false
+
+local function CreateHover(b)
+    if hoverBroken then return nil end
+
+    local made, h = pcall(CreateFrame, "Button", nil, b, "SecureUnitButtonTemplate")
+    if not made or not h then
+        hoverBroken = true
+        Print("|cffff4040hover-casting is unavailable on this client|r: "
+              .. tostring(h))
+        Print("the panel still draws; |cffffff00/tt twhover|r turns the setting off.")
+        return nil
+    end
+
+    -- Over the bar only. The aura icons next to it own their own mouse for
+    -- tooltips, and swallowing that to gain two icons' worth of hover area
+    -- would trade a thing that works for a thing that overlaps.
+    h:SetAllPoints(b.bar)
+    h:SetFrameLevel(b.bar:GetFrameLevel() + 5)
+
+    h:RegisterForClicks("AnyUp")
+    h:SetAttribute("*type1", "target")
+    h:SetAttribute("*type2", "togglemenu")
+
+    -- The panel is still draggable, and the button is now what the cursor
+    -- finds. Forwarded rather than contested: a press that moves drags, a
+    -- press that does not is a click.
+    h:RegisterForDrag("LeftButton")
+    h:SetScript("OnDragStart", StartDrag)
+    h:SetScript("OnDragStop", StopDrag)
+
+    -- How Clique and the other click-cast addons find a frame worth binding.
+    -- One line, and it means the panel works with whatever the player already
+    -- uses instead of growing a binding UI of its own.
+    _G.ClickCastFrames = _G.ClickCastFrames or {}
+    _G.ClickCastFrames[h] = true
+
+    h:Show()
+    b._hover = h
+    return h
+end
+
+-- Brings one block's button in step with the unit the block is drawing.
+-- Answers whether the two now agree, which is what the alpha is drawn from.
+local function SyncHover(b, unit)
+    if not db.twHoverCast then
+        -- Turned off. Nothing to be out of step with, so this always agrees --
+        -- but the button has to stop taking the mouse, and that is protected
+        -- too, so it waits for the pull to end like everything else here.
+        if b._hover and b._secureUnit ~= nil and not InCombatLockdown() then
+            b._hover:SetAttribute("unit", nil)
+            b._hover:Hide()
+            b._secureUnit = nil
+        end
+        return true
+    end
+
+    if b._hover and b._secureUnit == unit then return true end
+    if InCombatLockdown() then return false end
+
+    local h = b._hover or CreateHover(b)
+    if not h then return true end   -- refused outright; the setting is moot
+
+    h:SetAttribute("unit", unit)
+    h:Show()
+    b._secureUnit = unit
+    return true
 end
 
 --------------------------------------------------------------------------------
@@ -418,6 +559,73 @@ local function CollectUnits()
     return shownUnits
 end
 
+-- Which block each tank is drawn in.
+--
+-- Out of combat this is just roster order, which is what the panel has always
+-- shown. In combat it is pinned: a bar stays with the unit its secure button
+-- already names, and anyone left over fills the gaps.
+--
+-- Not a tidiness rule. The button carries the unit a click lands on, and that
+-- attribute cannot be rewritten in combat -- so a bar that changed occupant
+-- mid-pull would be showing one tank over a button that casts on another.
+-- Pinning to the button rather than to whoever is drawn is the point: the
+-- attribute is the half that cannot move, so it is the half that decides.
+--
+-- Which also means this does nothing at all when hover-casting is off. With no
+-- button there is no constraint, and roster order is simply better.
+--
+-- It happens to stop the panel reshuffling under the cursor mid-fight too,
+-- which is worth having on its own.
+local slots = {}
+local taken = {}
+
+local function AssignBlocks(units, count)
+    -- Preview is the player repeated, so "which block is this tank in" has no
+    -- answer and does not need one.
+    if previewMode or not db.twHoverCast then return units end
+    if not InCombatLockdown() then return units end
+
+    twipe(slots)
+    twipe(taken)
+
+    for i = 1, count do
+        local b = blocks[i]
+        -- _secureUnit, not _unit: a roster event clears _unit on purpose, so
+        -- that names and class colours are redrawn for a new occupant. The
+        -- attribute survives it, because the client would not let us clear it
+        -- either -- which is exactly what makes it the honest record of what
+        -- this bar is still wired to.
+        local u = b and b._secureUnit
+        if u and not taken[u] then
+            for j = 1, count do
+                if units[j] == u then
+                    slots[i], taken[u] = u, true
+                    break
+                end
+            end
+        end
+    end
+
+    local nextUnit = 1
+    for i = 1, count do
+        if not slots[i] then
+            while nextUnit <= count and taken[units[nextUnit]] do
+                nextUnit = nextUnit + 1
+            end
+            if nextUnit > count then break end
+            slots[i], taken[units[nextUnit]] = units[nextUnit], true
+        end
+    end
+
+    -- A hole would draw an empty block between two full ones. There should
+    -- never be one -- every unit not already placed is placed by the second
+    -- pass -- so this is the belt on the braces rather than a real path.
+    for i = 1, count do
+        if not slots[i] then return units end
+    end
+    return slots
+end
+
 local function Hide()
     if frame:IsShown() then
         frame:Hide()
@@ -474,6 +682,8 @@ local function Refresh()
     if not previewMode and count < MinTanks() then return Hide() end
     if count == 0 then return Hide() end
 
+    units = AssignBlocks(units, count)
+
     -- Layout is re-applied only when a setting changed or the number of blocks
     -- did, so the steady state is health and aura writes and nothing else.
     local relayout = (builtSerial ~= looksSerial) or (frame._count ~= count)
@@ -521,6 +731,14 @@ local function Refresh()
 
         ShowRing(b, db.twAggroRing and not previewMode and HoldingABoss(unit))
 
+        -- Last, because the alpha below is drawn from whether it worked, and
+        -- everything above has to have settled on an occupant first.
+        local inStep = SyncHover(b, unit)
+        if b._dimmed ~= not inStep then
+            b._dimmed = not inStep
+            b:SetAlpha(inStep and 1 or 0.45)
+        end
+
         b._unit = unit
         b:Show()
     end
@@ -565,14 +783,8 @@ local function BuildFrame()
     f:EnableMouse(false)
     f:RegisterForDrag("LeftButton")
 
-    f:SetScript("OnDragStart", function(self)
-        if not db.twLocked then self:StartMoving() end
-    end)
-    f:SetScript("OnDragStop", function(self)
-        self:StopMovingOrSizing()
-        local point, _, relPoint, x, y = self:GetPoint()
-        db.twPoint = { point, relPoint, x, y }
-    end)
+    f:SetScript("OnDragStart", StartDrag)
+    f:SetScript("OnDragStop", StopDrag)
 
     -- Shown only while unlocked, so the panel is invisible furniture in a
     -- fight and a draggable object the moment you want to move it.
@@ -997,6 +1209,32 @@ ns.RegisterCommand{
 }
 
 ns.RegisterCommand{
+    name = "twhover", section = "co-tanks:", order = 22,
+    desc = "toggle hover-casting on the bars",
+    handler = function()
+        db.twHoverCast = not db.twHoverCast
+        ns.RefreshTankWatch()
+
+        if db.twHoverCast then
+            Print("hover-casting |cff00ff00on|r -- the bars are unit frames. "
+                  .. "|cffffff00@mouseover|r lands on whichever tank the cursor "
+                  .. "is over, left-click targets, right-click opens the menu.")
+            Print("a macro to hang it on: |cffffff00/cast [@mouseover,help,nodead]"
+                  .. "[] Your Spell|r")
+        else
+            Print("hover-casting |cffff0000off|r -- the bars take no mouse and "
+                  .. "clicks fall through to the world behind them.")
+        end
+
+        if InCombatLockdown() then
+            Print("|cffff8000You are in combat|r, so the bars change over when "
+                  .. "the pull ends -- the client will not let a click target "
+                  .. "be rewritten mid-fight.")
+        end
+    end,
+}
+
+ns.RegisterCommand{
     name = "twsolo", section = "co-tanks:", order = 25,
     desc = "show the panel when you are the only tank in an instance",
     handler = function()
@@ -1148,11 +1386,41 @@ ns.RegisterCommand{
 -- Status
 --------------------------------------------------------------------------------
 
+-- How many bars actually carry a click target, and how many are drawing
+-- somebody their button has not caught up with. The difference between "hover
+-- casting is on" and "hover casting is working" is otherwise invisible until
+-- the moment a cooldown lands on the wrong tank.
+local function SecureCount()
+    local n = 0
+    for i = 1, #blocks do
+        if blocks[i]._secureUnit then n = n + 1 end
+    end
+    return n
+end
+
+local function StaleCount()
+    local n = 0
+    for i = 1, #blocks do
+        local b = blocks[i]
+        if b._unit and b._secureUnit ~= b._unit then n = n + 1 end
+    end
+    return n
+end
+
 ns.RegisterStatusProvider(30, function(yn)
     Print("co-tank panel: " .. yn(db.twEnabled)
           .. "  |  tanks in group: " .. #ns.tankUnits
           .. "  |  drawn: " .. #shownUnits
           .. "  |  preview: " .. yn(previewMode))
+    Print("hover-cast: " .. yn(db.twHoverCast and not hoverBroken)
+          .. "  |  bars wired: " .. SecureCount()
+          .. "  |  waiting on combat: " .. StaleCount())
+
+    if hoverBroken then
+        Print("|cffff4040Hover-casting was refused by this client|r -- the "
+              .. "secure button could not be created, so the bars are display "
+              .. "only. Everything else on the panel is unaffected.")
+    end
 
     local ticker = ns.GetTicker("tankwatch")
     if ticker and ticker.disabled then
@@ -1182,6 +1450,8 @@ ns.RegisterOptionsSection{
         y = ui.Check(f, x, y, "Show health percent", db, "twShowPercent", apply)
         y = ui.Check(f, x, y, "Ring whoever is holding a boss", db, "twAggroRing", apply)
         y = ui.Check(f, x, y, "Lock in place", db, "twLocked", ApplyLock)
+        y = ui.Check(f, x, y, "Hover a bar to cast on that tank",
+                     db, "twHoverCast", ns.RefreshTankWatch)
 
         y = y - 10
         y = ui.Header(f, "Layout", x, y)
@@ -1243,7 +1513,20 @@ ns.RegisterOptionsSection{
             end)
 
         return ui.Note(f, x, y,
-            "Unlock the panel to drag it; the grey block\n"
+            "Hover a bar to cast on that tank makes the\n"
+            .. "bars unit frames: an [@mouseover] macro lands\n"
+            .. "on whoever the cursor is over, left-click\n"
+            .. "targets and right-click opens the menu.\n"
+            .. "Clique and friends pick them up too.\n\n"
+            .. "The bars take the mouse while it is on, so\n"
+            .. "clicks over them no longer reach the world.\n"
+            .. "Dragging still works when unlocked.\n\n"
+            .. "A tank joining mid-pull cannot be wired up\n"
+            .. "until the fight ends -- the game will not let\n"
+            .. "a click target change in combat. That bar is\n"
+            .. "drawn faded until it catches up, so a half-\n"
+            .. "faded bar means look, do not click.\n\n"
+            .. "Unlock the panel to drag it; the grey block\n"
             .. "is the drag handle and disappears once\n"
             .. "locked. Preview fills it with three copies\n"
             .. "of you so you can place it solo.\n\n"

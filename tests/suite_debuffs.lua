@@ -129,6 +129,38 @@ Added({ spellId = 100003, isHarmful = true, dispelName = SECRETV })
 eq(Find(100003) and Find(100003).dispel, nil,
    "...which is not what a dispel type we were refused reads as")
 
+-- THE AURA THE PANEL CAN DRAW AND THE JOURNAL CANNOT NAME
+--
+-- The case that looks like a broken feature from the chair: UNIT_AURA still
+-- pushes a table during an encounter -- it is not an enumeration, so it is not
+-- refused -- but the id on it can be a secret. The panel renders that aura
+-- perfectly, because a display hands a value on unread, and the journal cannot
+-- touch it, because a record is keyed by spell id and a secret used as a table
+-- key throws.
+--
+-- So it is dropped, and it is COUNTED. The count is the whole difference
+-- between "this addon is broken" and "the client refused to answer", and those
+-- want opposite reactions from whoever is reading the status line.
+local unnamedBefore = NS.DebuffStats().unnamed
+local recordsBefore = NS.DebuffStats().total
+
+Added({ spellId = SECRETV, isHarmful = true })
+eq(NS.DebuffStats().unnamed, unnamedBefore + 1,
+   "an aura the client will not name is counted, not silently dropped")
+eq(NS.DebuffStats().total, recordsBefore,
+   "and no record is filed under a key we could not read")
+
+-- A readable `false` is a buff, not a refusal, and must not inflate the count
+-- that exists to mean "we were denied".
+local harmfulBefore = NS.DebuffStats().unreadableHarmful
+Added({ spellId = 200003, isHarmful = false })
+eq(NS.DebuffStats().unreadableHarmful, harmfulBefore,
+   "a buff is not counted as an aura we were refused")
+
+Added({ spellId = 200004, isHarmful = SECRETV })
+eq(NS.DebuffStats().unreadableHarmful, harmfulBefore + 1,
+   "but an unreadable isHarmful is")
+
 --------------------------------------------------------------------------------
 section("a fact learned is not unlearned")
 --------------------------------------------------------------------------------
@@ -277,21 +309,170 @@ ok(copy ~= NS.DebuffRecords(), "each call hands back a different array")
 eq(#NS.DebuffRecords(), size, "and editing one does not shorten the journal")
 
 --------------------------------------------------------------------------------
-section("the log door can be shut on us")
+section("our own lines survive a secret GUID")
 --------------------------------------------------------------------------------
 
--- A GUID we are not allowed to read means every log line is somebody's and
--- none is provably ours. Reported rather than silently halving the journal.
+-- This is the regression that made the journal thinnest in exactly the content
+-- worth cataloguing. Inside an instance UnitGUID("player") is a secret, so the
+-- GUID compare could never match and the log door shut itself in the one place
+-- the aura door was already shut -- both doors closed at once, and the feature
+-- looked broken rather than restricted.
+--
+-- destFlags is the way out: an affiliation bitmask on the log line, needing
+-- nobody's identity, so a line aimed at us is recognisably ours in a raid.
 WORLD.guidSecret = true
 FireEvent("PLAYER_ENTERING_WORLD")
 
-FireCombatLog("SPELL_AURA_APPLIED", 650001, "Unattributable", "DEBUFF")
-ok(Find(650001) == nil, "nothing is recorded from a log we cannot attribute")
-eq(NS.DebuffStats().logOpen, false, "and the journal says the door is shut")
+FireCombatLog("SPELL_AURA_APPLIED", 650001, "Ours Anyway", "DEBUFF")
+ok(Find(650001) ~= nil, "a line flagged MINE is recorded without a readable GUID")
+eq(NS.DebuffStats().logOpen, true, "and the journal reports the door open")
+eq(NS.DebuffStats().selfByFlag, true, "attributed by the affiliation mask")
+
+-- Both routes gone at once: no GUID to compare, and a mask the client will not
+-- let us read either. Nothing is recorded, and nothing throws.
+FireCombatLog("SPELL_AURA_APPLIED", 650002, "Unattributable", "DEBUFF",
+              nil, SECRETV)
+ok(Find(650002) == nil, "nothing is recorded when neither route can attribute it")
 
 WORLD.guidSecret = false
 FireEvent("PLAYER_ENTERING_WORLD")
-eq(NS.DebuffStats().logOpen, true, "which reopens when the client relents")
+
+--------------------------------------------------------------------------------
+section("co-tank debuffs")
+--------------------------------------------------------------------------------
+
+-- The point of recording anybody but ourselves: the co-tank row draws auras on
+-- the OTHER tank, so a journal that only ever saw our own debuffs could never
+-- offer us the one we actually watched all night and wanted to mark.
+WORLD.inRaid, WORLD.groupSize = true, 3
+WORLD.units["raid1"] = { name = "Tankadin", guid = WORLD.guid,
+                         combatRole = "TANK",   hp = 100, hpMax = 100, auras = {} }
+WORLD.units["raid2"] = { name = "Bearbutt", guid = "Player-2-BEARBUTT",
+                         combatRole = "TANK",   hp = 100, hpMax = 100, auras = {} }
+WORLD.units["raid3"] = { name = "Healbot",  guid = "Player-3-HEALBOT",
+                         combatRole = "HEALER", hp = 100, hpMax = 100, auras = {} }
+FireEvent("GROUP_ROSTER_UPDATE")
+
+ok(#NS.tankUnits >= 2, "the roster produced co-tanks")
+eq(NS.DebuffStats().tanksBlind, 0, "whose GUIDs are readable out here")
+
+FireCombatLog("SPELL_AURA_APPLIED", 660001, "Tank Smash", "DEBUFF",
+              "Player-2-BEARBUTT")
+ok(Find(660001) ~= nil, "a co-tank's debuff is recorded from the log")
+
+-- The scope is tanks, and a scope that quietly took everybody would fill the
+-- journal with other people's problems.
+FireCombatLog("SPELL_AURA_APPLIED", 660002, "Healer Problem", "DEBUFF",
+              "Player-3-HEALBOT")
+ok(Find(660002) == nil, "a healer's is not")
+
+if not SECRET_AURAS then
+    -- The rich door, pointed at somebody else. SCAN_GAP has to pass first: the
+    -- zone-in above already scanned, and a second walk inside the same second
+    -- is the throttle doing its job.
+    WORLD.units["raid2"].auras = { Aura(660003, { name = "On The Other Tank",
+                                                  boss = true }) }
+    Tick(1.5)
+    FireEvent("UNIT_AURA", "raid2")
+    local r = Find(660003)
+    ok(r ~= nil, "a co-tank's aura is read where the client allows it")
+    if r then eq(r.via, "aura", "and recorded through the rich door") end
+end
+
+-- WHAT THIS CANNOT DO, STATED RATHER THAN HIDDEN
+--
+-- Attributing a log line to a co-tank *specifically* needs a GUID, and an
+-- encounter takes GUIDs away. destFlags cannot stand in: its affiliation bits
+-- distinguish mine / party / raid and have no notion of role, so "this line is
+-- about a tank" is exactly the question the mask cannot answer.
+--
+-- So co-tank recording degrades to nothing inside an encounter, and the status
+-- command says so. That is the honest shape of it -- the alternative is a
+-- journal that silently stops learning about the other tank on the one night
+-- it matters.
+WORLD.guidSecret = true
+FireEvent("GROUP_ROSTER_UPDATE")
+
+eq(NS.DebuffStats().tanksKnown, 0, "no co-tank can be recognised")
+ok(NS.DebuffStats().tanksBlind > 0, "and the journal counts how many it lost")
+
+FireCombatLog("SPELL_AURA_APPLIED", 660004, "Unattributable Tank Hit", "DEBUFF",
+              "Player-2-BEARBUTT")
+ok(Find(660004) == nil, "a co-tank's line cannot be attributed in an encounter")
+
+WORLD.guidSecret = false
+WORLD.inRaid, WORLD.groupSize = false, 0
+WORLD.units["raid1"], WORLD.units["raid2"], WORLD.units["raid3"] = nil, nil, nil
+FireEvent("GROUP_ROSTER_UPDATE")
+
+--------------------------------------------------------------------------------
+section("the third door -- the Encounter Journal")
+--------------------------------------------------------------------------------
+
+-- The door that does not care who the debuff lands on, and the only one that
+-- can answer before anybody has been hit. It is content data, so it works
+-- identically in both scenarios -- that is the whole point of it, and asserting
+-- it under `secret` is asserting exactly that.
+WORLD.journal = {
+    instance   = 1200,
+    encounters = {
+        { name = "Trash Boss", journalID = 2001, dungeonID = 3001, root = 10 },
+        { name = "The Boss",   journalID = 2002, dungeonID = 3002, root = 20 },
+    },
+    sections = {
+        -- The other boss, which must not be walked.
+        [10] = { title = "Wrong Boss Ability", spellID = 710001 },
+        -- A heading with no spell of its own, holding two abilities.
+        [20] = { title = "Abilities", firstChildSectionID = 21 },
+        [21] = { title = "Tank Buster", spellID = 700001, abilityIcon = 77,
+                 siblingSectionID = 22 },
+        [22] = { title = "Raid Wide",   spellID = 700002, siblingSectionID = 23 },
+        -- A child of a sibling: the walk has to go down as well as across.
+        [23] = { title = "Phase Two", firstChildSectionID = 24 },
+        [24] = { title = "Enrage", spellID = 700003 },
+    },
+}
+
+FireEvent("ENCOUNTER_START", 3002, "The Boss", 16, 20)
+
+ok(Find(700001) ~= nil, "a boss ability is learned before it ever lands")
+ok(Find(700002) ~= nil, "...including one on a sibling section")
+ok(Find(700003) ~= nil, "...and one nested under a sibling")
+ok(Find(710001) == nil, "another boss's abilities are not swept in")
+
+local jr = Find(700001)
+eq(jr.via,  "journal", "and it is marked as coming from the journal")
+eq(jr.n,    0,         "with no sightings, because nothing was seen")
+eq(jr.name, "Tank Buster", "the journal's own title is kept")
+
+-- The mapping that is easy to get wrong: ENCOUNTER_START carries the dungeon
+-- id, and looking the journal up by it directly finds nothing.
+eq(EJ_SELECTED, nil,
+   "the player's open Dungeon Journal was not repointed to do the lookup")
+
+eq(NS.DebuffStats().journalIDs, 3, "the status line counts what it learned")
+eq(NS.DebuffStats().journalErr, nil, "and reports no problem")
+
+-- A sighting upgrades a candidate rather than duplicating it: same spell id,
+-- so the same record, now with a real count on it.
+Added(Aura(700001, { name = "Tank Buster", boss = true }))
+jr = Find(700001)
+eq(jr.via, "aura", "meeting it for real upgrades the record")
+eq(jr.n,   1,      "and starts counting sightings from the first real one")
+
+-- A boss that is not in the journal says so rather than going quiet.
+FireEvent("ENCOUNTER_START", 9999, "Unknown Boss", 16, 20)
+ok(NS.DebuffStats().journalErr ~= nil, "an unlistable boss is reported")
+
+-- A client whose API needs the instance selected first. The addon prefers not
+-- to touch the selection, but a client that leaves it no choice must still
+-- work rather than silently learning nothing.
+WORLD.journal.needsSelect = true
+FireEvent("ENCOUNTER_START", 3001, "Trash Boss", 16, 20)
+ok(Find(710001) ~= nil, "it falls back to selecting when the client requires it")
+eq(EJ_SELECTED, 1200, "and says which instance it selected")
+
+WORLD.journal, EJ_SELECTED = nil, nil
 
 --------------------------------------------------------------------------------
 section("the window")
@@ -449,6 +630,131 @@ Slash("")
 local help = ""
 for _, line in ipairs(ChatSince(before)) do help = help .. Strip(line) .. "\n" end
 ok(help:find("/tt debuffs") ~= nil, "the command is listed in the help")
+
+--------------------------------------------------------------------------------
+section("marking")
+--------------------------------------------------------------------------------
+
+-- The last command cleared the journal, so this is a fresh record for a mark
+-- to land on.
+FireCombatLog("SPELL_AURA_APPLIED", 700001, "Trash Nuisance", "DEBUFF")
+
+local important, ignored = NS.DebuffMarkedIDs()
+eq(important[700001], nil, "unmarked to start")
+
+NS.SetDebuffMark(700001, "important")
+important, ignored = NS.DebuffMarkedIDs()
+eq(important[700001], true, "marking important puts the id in that set")
+eq(ignored[700001], nil,    "and not in the other")
+eq(NS.DebuffMarkCounts(), 1, "and the counts agree")
+
+NS.SetDebuffMark(700001, "bogus")
+eq(Find(700001).mark, "important",
+   "an unrecognised mark is refused rather than overwriting the real one")
+
+NS.SetDebuffMark(700001, "ignored")
+important, ignored = NS.DebuffMarkedIDs()
+eq(important[700001], nil,  "switching to ignored clears it from the important set")
+eq(ignored[700001], true,   "and sets it in the other one")
+
+NS.SetDebuffMark(700001, nil)
+important, ignored = NS.DebuffMarkedIDs()
+eq(important[700001], nil, "and nil clears the mark entirely")
+eq(ignored[700001], nil,   "from both sets")
+
+NS.SetDebuffMark(999999, "important")
+eq(NS.DebuffMarkCounts(), 0,
+   "marking an id the journal never recorded is a no-op")
+
+--------------------------------------------------------------------------------
+section("marks and pruning")
+--------------------------------------------------------------------------------
+
+FireCombatLog("SPELL_AURA_APPLIED", 700002, "Kept Forever", "DEBUFF")
+NS.SetDebuffMark(700002, "important")
+
+-- Four hundred fresh records, all newer than the marked one, is well past
+-- what it would take to prune an ordinary record on recency alone.
+for i = 1, 400 do
+    WALL = WALL + 1
+    FireCombatLog("SPELL_AURA_APPLIED", 710000 + i, "Padding " .. i, "DEBUFF")
+end
+
+ok(Find(700002) ~= nil,
+   "a marked record is not evicted even when the cap is long since passed")
+eq(#NS.DebuffRecords(), 401,
+   "and does not count against the four hundred unmarked slots")
+
+local forgotten = NS.ForgetDebuffs()
+eq(forgotten, 400, "forgetting only clears the unmarked four hundred")
+eq(#NS.DebuffRecords(), 1, "leaving the marked one behind")
+ok(Find(700002) ~= nil and Find(700002).mark == "important",
+   "record and mark both survive a forget")
+
+NS.SetDebuffMark(700002, nil)
+NS.ForgetDebuffs()
+eq(#NS.DebuffRecords(), 0, "clearing the mark lets the last one go too")
+
+--------------------------------------------------------------------------------
+section("marking from the row")
+--------------------------------------------------------------------------------
+
+FireCombatLog("SPELL_AURA_APPLIED", 700003, "Click Me", "DEBUFF")
+Tick(1)   -- the window is still open; flush the redraw
+
+panel.filter:SetText("Click Me")
+panel.filter._scripts.OnTextChanged(panel.filter)
+
+ok(rowFrames[1]._rec and rowFrames[1]._rec.id == 700003,
+   "the filtered row is bound to the new record")
+
+rowFrames[1]._scripts.OnMouseUp(rowFrames[1], "LeftButton")
+eq(Find(700003).mark, "important", "left-click marks the row important")
+ok(TextMatching(TextsIn(panel), "important") ~= nil,
+   "and the row grows an \"important\" chip")
+
+rowFrames[1]._scripts.OnMouseUp(rowFrames[1], "LeftButton")
+eq(Find(700003).mark, nil, "clicking the same mark again clears it")
+
+rowFrames[1]._scripts.OnMouseUp(rowFrames[1], "RightButton")
+eq(Find(700003).mark, "ignored", "right-click marks it ignored instead")
+eq(rowFrames[1]:GetAlpha(), 0.45, "and the row dims to say so")
+
+rowFrames[1]._scripts.OnMouseUp(rowFrames[1], "RightButton")
+eq(Find(700003).mark, nil, "clicking ignored again clears it")
+eq(rowFrames[1]:GetAlpha(), 1, "back at full opacity")
+
+panel.filter:SetText("")
+panel.filter._scripts.OnTextChanged(panel.filter)
+NS.ForgetDebuffs()
+
+--------------------------------------------------------------------------------
+section("an event the client will not register")
+--------------------------------------------------------------------------------
+
+-- The bug this guards, and it is nastier than it looks: a protected event does
+-- not raise. The client fires ADDON_ACTION_FORBIDDEN at the player's error
+-- display, leaves the event unregistered, and returns as though it worked -- so
+-- pcall reports success and the caller believes it is subscribed. The debuff
+-- journal believed exactly that, recorded nothing from the log, never learned
+-- why, and asked again every login, earning the player an error report each
+-- time. Only IsEventRegistered can tell.
+WORLD.forbiddenEvents = { TT_TEST_PROTECTED = true }
+
+eq(NS.RegisterEvent("TT_TEST_PROTECTED", function() end), false,
+   "a silently refused registration is reported as refused, not as success")
+eq(NS.RegisterEvent("TT_TEST_ORDINARY", function() end), true,
+   "and an ordinary one still registers")
+
+-- The refusal must leave nothing behind. An empty handler list would make the
+-- next attempt believe the event was already registered, skip the call, and
+-- silently never deliver it.
+WORLD.forbiddenEvents = nil
+eq(NS.RegisterEvent("TT_TEST_PROTECTED", function() end), true,
+   "and a later attempt is not poisoned by the earlier refusal")
+
+eq(NS.DebuffStats().logAllowed, true,
+   "the journal reports the combat log door it actually got")
 
 --------------------------------------------------------------------------------
 section("nothing latched")

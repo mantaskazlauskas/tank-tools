@@ -27,19 +27,50 @@ local broken   = {}   -- fn -> true, once it has passed the limit
 
 -- fn is called as fn(event, ...) -- the frame itself is never passed, because
 -- no module has any business touching it.
+--
+-- Answers whether the client accepted the registration, which is not a
+-- formality and is not answered by the call itself.
+--
+-- There are two ways to be refused and only one of them says so. A bad event
+-- name raises, and pcall catches that. A *protected* event does not raise at
+-- all: the client fires ADDON_ACTION_FORBIDDEN, leaves the frame unregistered,
+-- and returns as though it had worked. Believing that is how the debuff
+-- journal spent sessions certain the combat log was feeding it while nothing
+-- arrived -- and, because it never learned otherwise, asking again every
+-- single login and handing the player an error report each time.
+--
+-- So the call is guarded and the result is then checked. IsEventRegistered is
+-- the only witness there is.
 function ns.RegisterEvent(event, fn)
     local list = handlers[event]
     if not list then
+        -- Asked before the list exists, so a refusal leaves nothing behind. An
+        -- empty list would be worse than no list: the next attempt would find
+        -- it, skip the call, and quietly never receive the event.
+        if not pcall(frame.RegisterEvent, frame, event) then return false end
+
+        -- Only a definite "no" counts. A client that will not answer the
+        -- question at all leaves us where we were -- assuming it worked --
+        -- rather than throwing away an event that may well be registered.
+        local ok, registered = pcall(frame.IsEventRegistered, frame, event)
+        if ok and registered == false then return false end
+
         list = {}
         handlers[event] = list
-        frame:RegisterEvent(event)
     end
     list[#list + 1] = fn
+    return true
 end
 
--- Convenience for the common "several events, same handler" case.
+-- Convenience for the common "several events, same handler" case. False if any
+-- one of them was refused -- which of them is the caller's business to work
+-- out, and no caller has needed to yet.
 function ns.RegisterEvents(events, fn)
-    for i = 1, #events do ns.RegisterEvent(events[i], fn) end
+    local all = true
+    for i = 1, #events do
+        if not ns.RegisterEvent(events[i], fn) then all = false end
+    end
+    return all
 end
 
 frame:SetScript("OnEvent", function(_, event, ...)

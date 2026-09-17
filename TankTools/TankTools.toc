@@ -1,8 +1,8 @@
-## Interface: 120000, 120001, 120005, 120007, 120100
+## Interface: 120100
 ## Title: Tank Tools
 ## Notes: Marks enemy nameplates by threat, so yowa can see at a glance what is not yours.
 ## Author: mmantas
-## Version: 1.0.2
+## Version: 1.0.3
 ## SavedVariables: TankToolsDB
 ## OptionalDeps: EllesmereUI
 ## Category: Combat
@@ -26,6 +26,11 @@
 # The debuff journal is split the same way and for the same reason: the module
 # records and stores, the window in UI only draws. The window loads first and
 # calls into the module at runtime, never at file scope.
+#
+# ImportantCasts reads nothing at file scope from any other module -- it does
+# not consume Threat's state map, and it derives plate/cast truth fresh every
+# tick the same way Threat itself does -- so it has no ordering dependency and
+# sits last.
 
 Core\Namespace.lua
 Core\Secret.lua
@@ -46,3 +51,4 @@ Modules\Threat.lua
 Modules\Nameplates.lua
 Modules\TankWatch.lua
 Modules\Debuffs.lua
+Modules\ImportantCasts.lua
