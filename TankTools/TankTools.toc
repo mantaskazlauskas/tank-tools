@@ -2,7 +2,7 @@
 ## Title: Tank Tools
 ## Notes: Marks enemy nameplates by threat, so yowa can see at a glance what is not yours.
 ## Author: mmantas
-## Version: 1.0.3
+## Version: 1.1.0
 ## SavedVariables: TankToolsDB
 ## OptionalDeps: EllesmereUI
 ## Category: Combat
@@ -27,6 +27,11 @@
 # records and stores, the window in UI only draws. The window loads first and
 # calls into the module at runtime, never at file scope.
 #
+# Sounds and Symbols are data plus one function each, read by modules only at
+# runtime, so their place in Core is a convention rather than a dependency:
+# they sit last there, ahead of every module that plays an alert or draws a
+# marker.
+#
 # ImportantCasts reads nothing at file scope from any other module -- it does
 # not consume Threat's state map, and it derives plate/cast truth fresh every
 # tick the same way Threat itself does -- so it has no ordering dependency and
@@ -40,6 +45,8 @@ Core\Features.lua
 Core\State.lua
 Core\Ticker.lua
 Core\Commands.lua
+Core\Sounds.lua
+Core\Symbols.lua
 
 UI\Widgets.lua
 UI\AuraRow.lua

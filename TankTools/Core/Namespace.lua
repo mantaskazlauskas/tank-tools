@@ -97,6 +97,19 @@ ns.state = {
 function ns.FeatureEnabled(_) return true end
 function ns.FeatureAllows(_) return true end
 
+-- Core/Sounds.lua. Silence is the safe answer here only because the
+-- alternative is an error inside a ticker, which would latch the scan off.
+ns.DEFAULT_ALERT_SOUND = "warning"
+function ns.FindAlertSound(_) return nil end
+function ns.PlayAlertSound(_) end
+function ns.AlertSoundOptions() return {} end
+function ns.AlertSoundKeys() return "" end
+
+-- Core/Symbols.lua. Plain text is the safe answer: every glyph is drawn as
+-- written, which is exactly how the markers behaved before icons existed.
+function ns.GlyphMarkup(text) return text or "" end
+function ns.RaidSymbols() return {} end
+
 -- UI/Features.lua
 function ns.ShowFeatures() end
 function ns.ToggleFeatures() end

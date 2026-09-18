@@ -45,6 +45,7 @@ local M = ns.NewModule("threat", {
     defaults = {
         onlyTankSpec = true,   -- do nothing at all unless the player is a tank
         sound        = true,   -- audible alert when a mob stops being yours
+        soundChoice  = ns.DEFAULT_ALERT_SOUND,   -- a key from Core/Sounds.lua
     },
 })
 
@@ -247,7 +248,7 @@ local function CheckAlerts()
 
     if fire and now - lastAlert > ALERT_COOLDOWN then
         lastAlert = now
-        if db.sound then PlaySound(SOUNDKIT.RAID_WARNING, "Master") end
+        if db.sound then ns.PlayAlertSound(db.soundChoice) end
     end
 end
 
@@ -379,12 +380,26 @@ end
 
 ns.RegisterCommand{
     name    = "sound",
+    args    = "[s]",
     section = "other:",
     order   = 10,
-    desc    = "toggle the lost-mob sound",
-    handler = function()
-        db.sound = not db.sound
-        Print("lost-mob sound " .. (db.sound and "enabled." or "disabled."))
+    desc    = "toggle the lost-mob sound, or pick one",
+    handler = function(_, larg)
+        if not larg or larg == "" then
+            db.sound = not db.sound
+            Print("lost-mob sound " .. (db.sound and "enabled." or "disabled."))
+            return
+        end
+        local s = ns.FindAlertSound(larg)
+        if s then
+            -- Picking a sound is asking to hear it, so it also switches the
+            -- alert on -- choosing one that then never plays would be a trap.
+            db.soundChoice, db.sound = s.key, true
+            ns.PlayAlertSound(s.key)
+            Print("lost-mob sound set to " .. s.text .. ".")
+        else
+            Print("usage: /tt sound [" .. ns.AlertSoundKeys() .. "]")
+        end
     end,
 }
 
@@ -457,6 +472,10 @@ ns.RegisterOptionsSection{
         y = ns.ui.Header(f, "General", x, y)
         y = ns.ui.Check(f, x, y, "Only in a tank spec", M.db, "onlyTankSpec")
         y = ns.ui.Check(f, x, y, "Sound when a mob stops being yours", M.db, "sound")
+        -- Selecting a sound plays it: the picker is also the preview.
+        y = ns.ui.Segmented(f, x, y, "Lost-mob sound", M.db, "soundChoice",
+            ns.AlertSoundOptions(),
+            function() ns.PlayAlertSound(M.db.soundChoice) end, 3)
         return y
     end,
 }

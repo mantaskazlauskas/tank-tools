@@ -5,3 +5,6 @@ __pycache__/
 settings.json
 .zoo
 .venv/
+
+# Machine-specific: the WoW install path differs per person.
+.claude/settings.local.json

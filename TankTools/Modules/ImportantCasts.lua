@@ -2,8 +2,17 @@
 -- Tank Tools -- important-cast marker
 --
 -- A second question, answered the same way the aggro marker answers the
--- first: a glyph on the nameplate, plus a sound, when an enemy starts casting
--- something the game itself flags as worth your attention.
+-- first: a glyph on the nameplate when an enemy starts casting something the
+-- game itself flags as worth your attention.
+--
+-- A glyph and nothing else. There used to be a sound too, and it could only
+-- ever work outdoors: inside an instance the important-cast answer is secret,
+-- the glyph survives because the client draws it (see Mark), and nothing
+-- equivalent exists for audio -- every sound call refuses a secret argument
+-- from addon code (C_Sound.PlaySound is AllowedWhenUntainted), no event fires
+-- only for important casts, and a frame's OnShow fires for the invisible
+-- markers too. A sound that is silent in exactly the content a tank cares
+-- about is a setting that lies, so it went.
 --
 -- "Worth your attention" is not a spell-ID list this addon curates. It is
 -- read straight from `C_Spell.IsSpellImportant`, the same flag the default UI
@@ -32,13 +41,12 @@ local C_NamePlate        = C_NamePlate
 local C_Spell            = C_Spell
 local strupper, strlower = string.upper, string.lower
 
-local IsFalse, IsTrue = ns.IsFalse, ns.IsTrue
+local IsFalse, IsSecret = ns.IsFalse, ns.IsSecret
 local Print           = ns.Print
 
 local M = ns.NewModule("importantcasts", {
     defaults = {
         icMarker = true,                    -- show the glyph
-        icSound  = true,                    -- also play a sound
         icGlyph  = "!!",                     -- distinct from the aggro marker's "!"
         icSize   = 30,
         icAnchor = "TOP",                   -- distinct from the aggro marker's default LEFT
@@ -76,18 +84,46 @@ for i = 1, 40 do PLATE_UNITS[i] = "nameplate" .. i end
 
 local markerByPlate = {}   -- plate frame -> marker
 local markedUnit    = {}   -- unit token -> the marker currently shown for it
-local announced     = {}   -- unit token -> true once this cast has made a sound
+-- unit token -> true while its marker is up but the *client* decides whether
+-- it can be seen, because the important-cast answer was secret. Kept apart
+-- from markedUnit so /tt status can say "armed, unreadable" instead of
+-- counting every casting mob in a dungeon as an important one.
+local unreadable    = {}
 
+-- Three frames deep, and each layer has one job:
+--
+--   m      ours. Anchored to the plate, shown and hidden, and the only one of
+--          the three we ever read (IsShown) -- which is why it is on top.
+--   gate   takes the important-cast answer through SetAlphaFromBoolean. Inside
+--          an instance that answer is a secret boolean, and this is the one
+--          door a tainted addon has for acting on one: the client resolves it
+--          and the addon never learns which way it went. Doing so marks the
+--          frame's alpha secret for good (SecretArgumentsAddAspect), so nothing
+--          ever reads this frame's alpha, and nothing but the gate sets it.
+--   inner  holds the glyph and the pulse. The pulse is an Alpha animation, and
+--          on the gate itself it would drive the very alpha the gate exists
+--          to set; one level down, effective alpha multiplies instead.
+--
+-- Blizzard's own important-cast ring is built the same way round -- its flash
+-- is an Alpha animation on a child texture (Blizzard_NamePlateCastingBar.xml).
 local function CreateMarker(plate)
     local m = CreateFrame("Frame", nil, plate)
     m:SetSize(1, 1)
 
-    m.text = m:CreateFontString(nil, "OVERLAY")
+    local gate = CreateFrame("Frame", nil, m)
+    gate:SetAllPoints()
+    m.gate = gate
+
+    local inner = CreateFrame("Frame", nil, gate)
+    inner:SetAllPoints()
+    m.inner = inner
+
+    m.text = inner:CreateFontString(nil, "OVERLAY")
     m.text:SetPoint("CENTER")
 
     -- Same BOUNCE alpha pulse as the aggro marker, bottoming out well above
     -- zero so the glyph stays legible through the whole cycle.
-    local ag = m:CreateAnimationGroup()
+    local ag = inner:CreateAnimationGroup()
     ag:SetLooping("BOUNCE")
     local a = ag:CreateAnimation("Alpha")
     a:SetFromAlpha(1)
@@ -120,7 +156,7 @@ local function ApplyLook(m, plate)
     m:SetPoint(a[1], plate, a[2], a[3], a[4])
     m:SetFrameLevel(plate:GetFrameLevel() + 50)
 
-    m.text:SetText(db.icGlyph or "")
+    m.text:SetText(ns.GlyphMarkup(db.icGlyph))
     local c = db.icColor or { 1, 0.2, 0.2 }
     m.text:SetTextColor(c[1], c[2], c[3])
 end
@@ -133,17 +169,19 @@ local function Clear(unit)
     local m = markedUnit[unit]
     if m then
         m.pulse:Stop()
-        m:SetAlpha(1)
+        m.inner:SetAlpha(1)
         m:Hide()
         markedUnit[unit] = nil
     end
-    announced[unit] = nil
+    unreadable[unit] = nil
 end
 
--- `announced` is the "this cast has already made a sound" flag and is kept
--- independently of the marker frame: sound and glyph are separate toggles,
--- and either can be on with the other off.
-local function Mark(unit)
+-- `important` is either a readable true or the client's secret boolean --
+-- never a readable false, which ScanUnit has already turned into Clear().
+local function Mark(unit, important)
+    local hidden = IsSecret(important)
+    unreadable[unit] = hidden or nil
+
     if db.icMarker then
         local plate = C_NamePlate.GetNamePlateForUnit(unit)
         if plate then
@@ -154,22 +192,25 @@ local function Mark(unit)
             end
             if not m:IsShown() then m:Show() end
 
+            -- Last, after anything else that touches alpha: a SetAlpha after
+            -- this would override the client's answer.
+            if hidden then
+                m.gate:SetAlphaFromBoolean(important, 1, 0)
+            else
+                m.gate:SetAlpha(1)
+            end
+
             local wantPulse = db.icPulse
             if wantPulse ~= m.pulse:IsPlaying() then
                 if wantPulse then
                     m.pulse:Play()
                 else
                     m.pulse:Stop()
-                    m:SetAlpha(1)
+                    m.inner:SetAlpha(1)
                 end
             end
             markedUnit[unit] = m
         end
-    end
-
-    if db.icSound and not announced[unit] then
-        announced[unit] = true
-        PlaySound(SOUNDKIT.RAID_WARNING, "Master")
     end
 end
 
@@ -185,23 +226,51 @@ end
 --------------------------------------------------------------------------------
 -- Scan
 --
--- Whether a cast is "important" is read through the same secret-safe door as
--- everything else in this addon (see Core/Secret.lua): C_Spell.IsSpellImportant
--- can come back a secret boolean, and IsTrue() is both false for "no" and for
--- "cannot say" -- so an unreadable answer fails CLOSED here (no marker, no
--- sound). That is the opposite direction from the identity gates in
--- Threat.lua, and deliberately so: those exist to keep the addon from
--- blinding itself to a real mob, where failing open is the safe side; this is
--- a decorative alert, where showing nothing on an unreadable answer is the
--- safe side.
+-- Inside an instance nearly everything here is secret. UnitCastingInfo and
+-- UnitChannelInfo carry SecretWhenUnitSpellCastRestricted -- for any unit that
+-- is not you or your pet, the spell ID comes back secret -- and
+-- C_Spell.IsSpellImportant accepts that secret ID and answers with a secret
+-- boolean.
+--
+-- This file used to launder that answer through IsTrue() and fail closed on
+-- "cannot say". Failing closed on a secret that is secret *everywhere the
+-- feature matters* is not a safe default; it is the feature switched off in
+-- every dungeon, silently. So a secret answer is not read at all: the marker
+-- is put up for the cast and the client decides, through SetAlphaFromBoolean,
+-- whether it can be seen. That is how EllesmereUI's nameplates do it.
+--
+-- Two things that must never happen to the answer, because both throw:
+-- a boolean test (`if imp`, `imp and ...`, `not imp`) and a comparison. It is
+-- only ever handed to IsSecret() and, if secret, straight to the gate.
 --------------------------------------------------------------------------------
 
 local previewMode = false
 
+-- Casting at all? Answered from isTradeskill, which the client declares
+-- NeverSecret and returns for every cast and channel -- so this stays a
+-- readable question inside an instance, where the name and spell ID do not.
+-- Field positions match UnitCastingInfo/UnitChannelInfo exactly: a cast
+-- carries castID (position 7) that a channel does not, which shifts
+-- notInterruptible and spellID back by one.
+local function CastInfo(unit)
+    local _, _, _, _, _, isTradeskill, _, _, spellID = UnitCastingInfo(unit)
+    if isTradeskill ~= nil then return true, spellID, false end
+    local _, _, _, _, _, chTradeskill, _, chSpellID = UnitChannelInfo(unit)
+    if chTradeskill ~= nil then return true, chSpellID, true end
+    return false
+end
+
+-- pcall'd because the answer is not worth an error storm, and its failure is
+-- a readable false. Returns ok, answer -- the answer may be secret.
+local function Importance(spellID)
+    if not (C_Spell and C_Spell.IsSpellImportant) then return false end
+    return pcall(C_Spell.IsSpellImportant, spellID)
+end
+
 local function ScanUnit(unit)
     if previewMode then
         if UnitExists(unit) and not IsFalse(UnitCanAttack("player", unit)) then
-            Mark(unit)
+            Mark(unit, true)
         else
             Clear(unit)
         end
@@ -211,37 +280,22 @@ local function ScanUnit(unit)
     if not UnitExists(unit) then Clear(unit); return end
     if IsFalse(UnitCanAttack("player", unit)) then Clear(unit); return end
 
-    -- Field positions match UnitCastingInfo/UnitChannelInfo exactly: a cast
-    -- carries castID (position 7) that a channel does not, which shifts
-    -- notInterruptible and spellID back by one. Neither notInterruptible nor
-    -- castID is read here -- interruptibility is a different question from
-    -- "is this worth reacting to", and the important-cast flag answers that
-    -- one on its own.
-    local name, _, _, _, _, _, _, _, spellID = UnitCastingInfo(unit)
-    if not name then
-        name, _, _, _, _, _, _, spellID = UnitChannelInfo(unit)
-    end
-    if not name then Clear(unit); return end
+    local casting, spellID = CastInfo(unit)
+    if not casting then Clear(unit); return end
 
-    local important = false
-    if C_Spell and C_Spell.IsSpellImportant then
-        local castOK, imp = pcall(C_Spell.IsSpellImportant, spellID or 0)
-        if castOK then important = imp end
-    end
+    local ok, important = Importance(spellID)
+    if not ok then Clear(unit); return end
 
-    if IsTrue(important) then
-        Mark(unit)
+    -- IsSecret first: `important == true` would throw on a secret.
+    if IsSecret(important) or important == true then
+        Mark(unit, important)
     else
         Clear(unit)
     end
 end
 
-local function Wanted()
-    return db.icMarker or db.icSound
-end
-
 local function Tick()
-    if not (previewMode or Wanted()) then
+    if not (previewMode or db.icMarker) then
         if next(markedUnit) then
             for unit in pairs(markedUnit) do Clear(unit) end
         end
@@ -300,12 +354,6 @@ ns.RegisterCommand{
 }
 
 ns.RegisterCommand{
-    name = "icsound", section = "markers:", order = 130,
-    desc = "toggle the important-cast sound",
-    handler = Toggle("icSound", "important-cast sound"),
-}
-
-ns.RegisterCommand{
     name = "icpulse", section = "markers:", order = 140,
     desc = "toggle the important-cast pulse",
     handler = Toggle("icPulse", "important-cast pulse"),
@@ -348,9 +396,10 @@ ns.RegisterCommand{
         if arg and arg ~= "" then
             db.icGlyph = arg
             LooksChanged()
-            Print("important-cast symbol set to \"" .. arg .. "\".")
+            Print("important-cast symbol set to " .. ns.GlyphMarkup(arg) .. ".")
         else
-            Print("usage: /tt icglyph <text>")
+            Print("usage: /tt icglyph <text>, or a raid marker such as "
+                  .. "{skull}, {cross}, {star}")
         end
     end,
 }
@@ -390,28 +439,35 @@ ns.RegisterCommand{
 -- Diagnostics
 --------------------------------------------------------------------------------
 
+-- Everything printed through ns.Show, never tostring: inside an instance the
+-- name and spell ID are secret, and the whole point of this command is to say
+-- so rather than to throw.
 local function DumpUnit(unit)
-    local name, _, _, _, _, _, _, _, spellID = UnitCastingInfo(unit)
-    local channel = false
-    if not name then
-        name, _, _, _, _, _, _, spellID = UnitChannelInfo(unit)
-        channel = name ~= nil
-    end
-
-    if not name then
+    local casting, spellID, channel = CastInfo(unit)
+    if not casting then
         Print("  " .. unit .. ": not casting")
         return
     end
 
+    local name
+    if channel then name = UnitChannelInfo(unit) else name = UnitCastingInfo(unit) end
     local important = "n/a"
     if C_Spell and C_Spell.IsSpellImportant then
-        local castOK, imp = pcall(C_Spell.IsSpellImportant, spellID or 0)
+        local castOK, imp = Importance(spellID)
         important = castOK and ns.Show(imp) or "|cffff4040error|r"
     end
+
+    local verdict = ""
+    if unreadable[unit] then
+        verdict = markedUnit[unit] and "  |cffff8000armed -- the game decides if it shows|r"
+                  or "  |cffff8000unreadable|r"
+    elseif markedUnit[unit] then
+        verdict = "  |cff00ff00marked|r"
+    end
+
     Print(string.format("  %s: %s%s spellID=%s important=%s%s",
-                         unit, tostring(name), channel and " (channel)" or "",
-                         tostring(spellID), important,
-                         markedUnit[unit] and "  |cff00ff00marked|r" or ""))
+                         unit, ns.Show(name), channel and " (channel)" or "",
+                         ns.Show(spellID), important, verdict))
 end
 
 ns.RegisterCommand{
@@ -420,8 +476,7 @@ ns.RegisterCommand{
     desc = "why is nothing marked",
     handler = function()
         Print("|cffffff00---- important-cast scan ----|r")
-        Print("marker=" .. tostring(db.icMarker) .. "  sound=" .. tostring(db.icSound)
-              .. "  preview=" .. tostring(previewMode))
+        Print("marker=" .. tostring(db.icMarker) .. "  preview=" .. tostring(previewMode))
         local live = 0
         for i = 1, #PLATE_UNITS do
             local u = PLATE_UNITS[i]
@@ -442,10 +497,17 @@ ns.RegisterCommand{
 --------------------------------------------------------------------------------
 
 ns.RegisterStatusProvider(25, function(yn)
-    local n = 0
-    for _ in pairs(markedUnit) do n = n + 1 end
-    Print("important casts -- marker: " .. yn(db.icMarker) .. ", sound: " .. yn(db.icSound)
-          .. ", preview: " .. yn(previewMode) .. ", marked now: " .. n)
+    -- Two counts, not one: a readable "important" and a secret answer handed
+    -- to the client are different things, and adding them together would
+    -- report every casting mob in a dungeon as an important cast.
+    local marked, armed = 0, 0
+    for unit in pairs(markedUnit) do
+        if not unreadable[unit] then marked = marked + 1 end
+    end
+    for _ in pairs(unreadable) do armed = armed + 1 end
+    Print("important casts -- marker: " .. yn(db.icMarker)
+          .. ", preview: " .. yn(previewMode) .. ", marked now: " .. marked
+          .. ", unreadable (the game decides): " .. armed)
 
     local ticker = ns.GetTicker("importantcasts")
     if ticker and ticker.disabled then
@@ -464,7 +526,6 @@ ns.RegisterOptionsSection{
         local ui = ns.ui
         y = ui.Header(f, "Important casts", x, y)
         y = ui.Check(f, x, y, "Mark casts the game flags important", db, "icMarker", LooksChanged)
-        y = ui.Check(f, x, y, "Sound when one starts", db, "icSound", LooksChanged)
         y = ui.Check(f, x, y, "Pulse", db, "icPulse", LooksChanged)
         return y
     end,
@@ -476,7 +537,10 @@ ns.RegisterOptionsSection{
         return ns.ui.Note(f, x, y - 10,
             "Read from the game's own important-cast flag, the same one\n"
             .. "that rings a boss's cast bar -- not a spell list this addon\n"
-            .. "keeps, so it never goes stale.")
+            .. "keeps, so it never goes stale.\n\n"
+            .. "In dungeons and raids the game hides that flag from\n"
+            .. "addons, so the game itself decides whether the marker\n"
+            .. "shows. That is also why there is no sound for it.")
     end,
 }
 
@@ -495,6 +559,10 @@ ns.RegisterOptionsSection{
         y = ui.InputRow(f, x, y, "Symbol", db, {
             { label = "Symbol", key = "icGlyph" },
         }, LooksChanged)
+        y = ui.Symbols(f, x, y, "Or an icon", db, "icGlyph", LooksChanged)
+        y = ui.Note(f, x, y,
+            "Icons keep their own colors; the color below tints text\n"
+            .. "symbols only. {skull} typed in the box works too.")
         y = ui.Swatches(f, x, y, "Color", db, "icColor", LooksChanged, ns.COLOR_ORDER)
 
         y = ui.Button(f, x, y, "Preview marker on all nameplates",

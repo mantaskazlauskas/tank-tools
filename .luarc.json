@@ -39,6 +39,7 @@
       "IsInInstance",
       "IsInRaid",
       "PlaySound",
+      "PlaySoundFile",
       "RAID_CLASS_COLORS",
       "ReloadUI",
       "SOUNDKIT",

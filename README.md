@@ -22,7 +22,7 @@ inside an instance, and why none of them is what a tank acts on anyway.
 **Which enemy just started something worth reacting to?**
 
 A second, differently-shaped glyph (`!!` by default) appears over any enemy
-nameplate casting a spell the game itself flags important, plus a sound. See
+nameplate casting a spell the game itself flags important. See
 [The important-cast marker](#the-important-cast-marker).
 
 **How many stacks does the other tank have, and is it my turn?**
@@ -52,9 +52,14 @@ rather read a positive mark than an absence — some people find "nothing there"
 hard to trust mid-pull. It gets its own quieter color (grey by default) and it
 **never pulses**, so motion stays reserved for the two states that need you.
 
-When a mob that *was* yours stops being yours, a raid-warning sound plays. That
-is the one non-visual channel, and it fires in the moment you are looking at
-health bars rather than nameplates.
+When a mob that *was* yours stops being yours, a sound plays — the raid
+warning by default. That is the one non-visual channel, and it fires in the
+moment you are looking at health bars rather than nameplates.
+
+The sound is a choice: the raid warning, a bell, the PvP flag, or the game's
+own Low / Medium / Critical alerts. Selecting one in the settings plays it, so
+the picker is also the preview. It plays on the Master channel, so turning
+down sound effects does not silence it.
 
 ## Why a glyph and not a color
 
@@ -77,11 +82,19 @@ decoration applied last — turn the monitor monochrome and the marker still
 works perfectly. Every state is a differently *shaped* glyph, never a recolored
 one, so no two ever rely on being told apart by hue.
 
+A symbol can also be one of the eight raid markers, written the way chat
+writes them — `{skull}`, `{cross}`, `{star}`, `{rt8}` — or picked from the row
+of icons under each symbol box in the settings. They are the most familiar set
+of distinct silhouettes in the game, which is the property that matters here.
+Icons keep their own colors; the color swatches tint text symbols only. Emoji
+are not an option: the game's fonts have no emoji glyphs.
+
 ## The important-cast marker
 
 A second glyph, independent of the threat markers above and on by default: it
 appears over any enemy nameplate casting something the game itself flags
-important, plus a sound.
+important. There is deliberately no sound for it — see
+[The important-cast flag is secret inside instances](#the-important-cast-flag-is-secret-inside-instances).
 
 **"Important" is not a spell list this addon keeps.** It is read straight from
 `C_Spell.IsSpellImportant`, the same flag the default UI uses to ring a boss's
@@ -101,7 +114,6 @@ Unlike the threat scan, this does not track "still casting" across a gap: a
 cast either exists on a unit right now or it does not, so the marker is on
 exactly while `UnitCastingInfo`/`UnitChannelInfo` say a cast is running and the
 game agrees it is important — nothing is remembered between one and the next.
-The sound fires once per cast, not once per poll.
 
 ## The co-tank panel
 
@@ -477,18 +489,29 @@ it reach a comparison. Identity predicates then **fail open**: an unreadable
 threat data does the real gating and you cannot hold threat on a friendly unit.
 Failing closed is what blinds the addon in exactly the content it exists for.
 
-### The important-cast flag can be secret too
+### The important-cast flag is secret inside instances
 
-`UnitCastingInfo`/`UnitChannelInfo` themselves stay readable inside an
-instance — a cast bar has to work in a dungeon, so the name, icon and spell ID
-are never restricted. But `C_Spell.IsSpellImportant`'s answer can come back a
-secret boolean, the same as any other identity-adjacent read.
+`UnitCastingInfo`/`UnitChannelInfo` are declared
+`SecretWhenUnitSpellCastRestricted`: for any unit that is not you or your pet,
+the name, icon and spell ID come back secret. `C_Spell.IsSpellImportant`
+accepts the secret spell ID and answers with a secret boolean. Whether a unit
+is casting *at all* stays readable, through `isTradeskill`, which the client
+declares `NeverSecret`.
 
-That is handled through the same `Clean()`/`IsTrue()` door as everything else,
-but in the **opposite** direction from the identity gates above: an unreadable
-answer here means **no marker, no sound**, not "let it through". The important-
-cast marker is a decorative alert, not a check that would blind the addon to a
-real mob if it failed the other way — so it fails closed instead of open.
+So the answer is never read. The marker is put up for any cast whose answer is
+secret, and the answer is handed to `SetAlphaFromBoolean` on the marker's
+gate frame — the client resolves it and shows the glyph only if the cast is
+important, and the addon never learns which way it went. Failing closed here
+(the original design) meant no marker in any dungeon, which is to say no
+feature where it matters.
+
+A **sound** has no equivalent, which is why the marker has none. Playing one
+is a decision the addon has to make on an answer it cannot read: every sound
+call refuses a secret argument from addon code, nothing the client plays by
+itself is triggered by an important cast, and the marker's `OnShow` fires for
+the invisible markers too. It could only ever have worked out in the world —
+silent in exactly the content a tank cares about — so it was removed rather
+than left as a setting that mostly does nothing.
 
 ### What this costs inside instances
 
@@ -528,7 +551,7 @@ typing, and for macros.
 | `/tt nppulse` | toggle the pulse |
 | `/tt npsize <10-72>` | marker size |
 | `/tt npanchor <pos>` | left / right / top / bottom |
-| `/tt npglyph <text>` | "not mine" symbol (default `!`) |
+| `/tt npglyph <text>` | "not mine" symbol (default `!`) — text, or a raid marker such as `{skull}` |
 | `/tt npwarnglyph <text>` | "at risk" symbol (default `?`) |
 | `/tt npsecglyph <text>` | "mine" symbol (default `o`) |
 | `/tt npcolor <name>` | alert color — white / yellow / cyan / magenta / orange / green / grey |
@@ -543,15 +566,14 @@ typing, and for macros.
 | `/tt twhover` | toggle hover-casting on the bars |
 | `/tt debuffs` | open the debuff journal |
 | `/tt debuffs clear` | forget every recorded debuff |
-| `/tt sound` | toggle the lost-mob sound |
+| `/tt sound [name]` | toggle the lost-mob sound, or pick one — warning / bell / flag / low / medium / critical |
 | `/tt tankonly` | toggle tank-spec-only |
 | `/tt ictest` | preview the important-cast symbol on every nameplate |
 | `/tt ic` | toggle the important-cast marker |
-| `/tt icsound` | toggle the important-cast sound |
 | `/tt icpulse` | toggle its pulse |
 | `/tt icsize <10-72>` | its size |
 | `/tt icanchor <pos>` | left / right / top / bottom |
-| `/tt icglyph <text>` | its symbol (default `!!`) |
+| `/tt icglyph <text>` | its symbol (default `!!`), text or a raid marker |
 | `/tt iccolor <name>` | its color, same presets as the threat markers |
 
 The `/tt debuffs` rows exist only while the debuff journal's feature flag is
@@ -610,6 +632,8 @@ tank-tools/
       Ticker.lua             one OnUpdate, one failure latch per subscriber
       Commands.lua           slash registry, generated help, /tt status
       Features.lua           flags for modules that are not finished yet
+      Sounds.lua             the sounds the lost-mob alert chooses from
+      Symbols.lua            {skull}-style raid markers as marker symbols
     UI/
       Widgets.lua            checkbox, slider, segmented picker, swatches
       Options.lua            the settings window; modules register sections

@@ -348,6 +348,23 @@ eq(SOUNDS_PLAYED, 1, "losing a held mob fires the alert")
 
 Tick(0.25)
 eq(SOUNDS_PLAYED, 1, "the alert does not repeat while it stays lost")
+eq(LAST_SOUND.kit, SOUNDKIT.RAID_WARNING, "the default is still the raid warning")
+eq(LAST_SOUND.channel, "Master", "on the Master channel")
+
+-- The chosen sound is the one that plays, not merely one that is stored.
+db.modules.threat.soundChoice = "critical"
+WORLD.units["nameplate3"].threat.player = 3
+Tick(2)                          -- mine again, and past the alert cooldown
+WORLD.units["nameplate3"].threat.player = 0
+Tick(0.25)
+eq(SOUNDS_PLAYED, 2, "losing it again alerts again")
+eq(LAST_SOUND.file, 7670697, "with the chosen sound")
+
+-- A key from a newer or older build falls back rather than going silent.
+db.modules.threat.soundChoice = "no-such-sound"
+NS.PlayAlertSound(db.modules.threat.soundChoice)
+eq(LAST_SOUND.kit, SOUNDKIT.RAID_WARNING, "an unknown sound key falls back to the default")
+db.modules.threat.soundChoice = "warning"
 
 --------------------------------------------------------------------------------
 section("in an instance, with every identity read restricted")
@@ -405,6 +422,22 @@ eq(npdb.npColor[1], 0.35, "/tt npcolor rejects an unknown preset")
 Slash("npglyph X")
 eq(npdb.npGlyph, "X", "/tt npglyph keeps the argument's case")
 
+-- Raid-marker notation, the same spelling chat uses, drawn as the icon.
+eq(NS.GlyphMarkup("!"), "!", "a plain glyph is drawn as written")
+eq(NS.GlyphMarkup("{skull}"), "|T137008:0|t", "{skull} becomes the skull icon")
+eq(NS.GlyphMarkup("{rt8}"), "|T137008:0|t", "{rt8} is the skull too, as in chat")
+eq(NS.GlyphMarkup("{X}"), "|T137007:0|t", "{x} is the cross, case-insensitively")
+eq(NS.GlyphMarkup("!{star}"), "!|T137001:0|t", "icons mix with text")
+eq(NS.GlyphMarkup("{nope}"), "{nope}", "an unknown name stays visible as text")
+eq(NS.GlyphMarkup(nil), "", "no glyph draws nothing rather than erroring")
+
+local nChat = #CHAT
+Slash("npglyph {skull}")
+eq(npdb.npGlyph, "{skull}", "/tt npglyph stores the {name} form, not markup")
+ok(table.concat(ChatSince(nChat), " "):find("|T137008:0|t", 1, true) ~= nil,
+   "and the confirmation shows the icon itself")
+npdb.npGlyph = "X"
+
 local was = npdb.npMarker
 Slash("np")
 eq(npdb.npMarker, not was, "/tt np toggles")
@@ -414,6 +447,17 @@ eq(npdb.npMarkerSecure, true, "alias /tt npmine works")
 local wasSound = db.modules.threat.sound
 Slash("sound")
 eq(db.modules.threat.sound, not wasSound, "/tt sound toggles")
+
+db.modules.threat.sound = false
+local heard = SOUNDS_PLAYED
+Slash("sound bell")
+eq(db.modules.threat.soundChoice, "bell", "/tt sound <name> picks a sound")
+eq(db.modules.threat.sound, true, "and switches the alert on")
+eq(SOUNDS_PLAYED, heard + 1, "and plays it once as a preview")
+eq(LAST_SOUND.file, 566558, "the one that was picked")
+
+Slash("sound kazoo")
+eq(db.modules.threat.soundChoice, "bell", "/tt sound rejects an unknown name")
 
 --------------------------------------------------------------------------------
 section("help text")
@@ -539,6 +583,28 @@ ok(#NS.ui.controls >= 14, "controls registered for refresh: " .. #NS.ui.controls
 
 NS.RefreshOptions()
 ok(true, "refresh replays every control without error")
+
+-- The icon picker writes the same field the text box edits, and rings the
+-- icon in use -- and nothing, once the field holds a character again.
+do
+    local scratch = CreateFrame("Frame")
+    local store = { g = "!" }
+    NS.ui.Symbols(scratch, 0, 0, "icons", store, "g")
+    local buttons = {}
+    for _, k in ipairs(FramesParentedTo(scratch)) do
+        -- rawget: the harness answers any unknown field with a stub, so a
+        -- plain `k.ring` is truthy on every frame.
+        if rawget(k, "ring") then buttons[#buttons + 1] = k end
+    end
+    eq(#buttons, 8, "one button per raid marker")
+    buttons[1]._scripts.OnClick()
+    eq(store.g, "{skull}", "clicking the first icon picks the skull")
+    ok(buttons[1].ring:IsShown() and not buttons[2].ring:IsShown(),
+       "and rings only that one")
+    store.g = "!"
+    NS.RefreshOptions()
+    ok(not buttons[1].ring:IsShown(), "typing a character un-picks the icon")
+end
 
 NS.ToggleOptions()
 ok(not panel:IsShown(), "toggle hides")

@@ -357,3 +357,46 @@ anything secure, ask what the tick does to it, not what an instance does to it.
 cannot rewire a bar, so the panel stops trying" and "in combat a tank keeps the
 bar they are already in". The harness makes `SetAttribute` throw while
 `WORLD.inCombat` is set, so the suite fails loudly if the addon ever asks.
+
+## A fail-closed check on a secret boolean switches the feature off where it matters
+
+**Symptom:** "I pulled a mob with an important cast in a dungeon and it did not
+get marked or make a sound." Fine outdoors; the `importantcasts:secret` suite
+passed throughout.
+
+**Wrong diagnosis:** that the important-cast answer was only *sometimes* secret,
+so failing closed on it — no marker, no sound — was the safe side for a
+decorative alert. The harness agreed, because it modelled the answer as secret
+but left the cast's name and spell ID readable ("a cast bar has to work in a
+dungeon"). Neither was checked against the generated docs.
+
+**Cause:** `UnitCastingInfo`/`UnitChannelInfo` are `SecretWhenUnitSpellCastRestricted`
+— for any unit but you or your pet, the spell ID is secret — and
+`C_Spell.IsSpellImportant` accepts it (`AllowedWhenTainted`) and returns a
+secret boolean. `IsTrue(secret)` is false, so every cast in every instance took
+the "not important" branch. Failing closed on a value that is secret *everywhere
+the feature is used* is not a safe default; it is the feature turned off.
+
+**Fix:** never read the answer. In `Modules/ImportantCasts.lua` the marker is
+armed for any cast (casting-at-all comes from `isTradeskill`, declared
+`NeverSecret`), and the secret goes into `SetAlphaFromBoolean(imp, 1, 0)` on a
+gate frame, so the client decides whether it is seen — the way EllesmereUI's
+nameplates do it. The pulse lives one frame below the gate, because an Alpha
+animation on the gate would drive the alpha the gate exists to set. The
+*sound* has no equivalent: every sound call refuses a secret argument from
+addon code, a frame's `OnShow` fires for the invisible markers too, and no
+event fires on an alpha change. A sound that could only ever work outdoors
+was removed rather than kept as a setting that is silent where it matters.
+
+**Generalisation:** a secret boolean can drive what is *drawn* (`SetAlphaFromBoolean`,
+`EvaluateColorValueFromBoolean`) but never what the addon *does*. Before choosing
+a fail direction, ask whether the value is ever readable in the content the
+feature is for — if not, both directions are wrong and the answer has to go to
+the client unread. Truth-testing or comparing a secret *boolean* throws;
+truthiness on a secret string or number is allowed.
+
+**Pinned by:** `importantcasts:secret`. The harness now returns the cast's name
+and spell ID secret, and its secrets carry a payload only `SetAlphaFromBoolean`
+resolves, so the suite asserts what the player *sees* — an important cast
+visible, an ordinary one transparent — without the addon being able to read
+either.

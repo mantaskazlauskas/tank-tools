@@ -221,19 +221,26 @@ end
 -- Segmented picker. Used instead of a dropdown for small, fixed choice sets:
 -- every option stays visible, which suits "which side of the nameplate" far
 -- better than a collapsed list.
-function ui.Segmented(parent, x, y, text, store, key, options, onChange)
+--
+-- `perRow` wraps a longer set onto further rows rather than squeezing it into
+-- buttons too narrow for their labels. Omitted, everything is one row.
+function ui.Segmented(parent, x, y, text, store, key, options, onChange, perRow)
     local lbl = ui.Label(parent, text, 12)
     lbl:SetPoint("TOPLEFT", x, y)
 
     local buttons = {}
-    local n   = #options
-    local gap = 4
-    local bw  = (ui.COL_W - (gap * (n - 1))) / n
+    local n    = #options
+    local cols = (perRow and perRow < n) and perRow or n
+    local rows = (cols > 0) and math.ceil(n / cols) or 1
+    local gap  = 4
+    local bw   = (ui.COL_W - (gap * (cols - 1))) / math.max(cols, 1)
 
     for i, opt in ipairs(options) do
+        local col = (i - 1) % cols
+        local row = floor((i - 1) / cols)
         local b = CreateFrame("Button", nil, parent, "UIPanelButtonTemplate")
         b:SetSize(bw, 20)
-        b:SetPoint("TOPLEFT", x + (i - 1) * (bw + gap), y - 16)
+        b:SetPoint("TOPLEFT", x + col * (bw + gap), y - 16 - row * (20 + gap))
         b:SetText(opt.text)
 
         local sel = b:CreateTexture(nil, "OVERLAY")
@@ -265,7 +272,7 @@ function ui.Segmented(parent, x, y, text, store, key, options, onChange)
     end
     Add(holder)
 
-    return y - 42
+    return y - 42 - (rows - 1) * (20 + gap)
 end
 
 -- Color swatches. Deliberately NOT skinned: a swatch has to show its own
@@ -331,7 +338,57 @@ function ui.Swatches(parent, x, y, text, store, key, onChange, order)
     return y - 46
 end
 
--- Several one-character fields on a single line. Glyphs are chosen against
+-- The eight raid markers as clickable icons. Picking one stores its `{name}`
+-- form in the same field the text box edits (Core/Symbols.lua turns it into
+-- the icon at draw time), so the two stay one setting: the box shows
+-- `{skull}` after a click, and typing a character there un-picks the icon.
+function ui.Symbols(parent, x, y, text, store, key, onChange)
+    local lbl = ui.Label(parent, text, 12)
+    lbl:SetPoint("TOPLEFT", x, y)
+
+    local symbols = ns.RaidSymbols()
+    local buttons = {}
+    local size, gap = 24, 8
+
+    for i, s in ipairs(symbols) do
+        local b = CreateFrame("Button", nil, parent)
+        b:SetSize(size, size)
+        b:SetPoint("TOPLEFT", x + (i - 1) * (size + gap), y - 16)
+
+        local tex = b:CreateTexture(nil, "ARTWORK")
+        tex:SetPoint("TOPLEFT", 2, -2)
+        tex:SetPoint("BOTTOMRIGHT", -2, 2)
+        tex:SetTexture(s.file)
+
+        -- BACKGROUND under the inset icon, so it reads as a ring -- the same
+        -- construction as a selected color swatch, for the same reason.
+        local ring = b:CreateTexture(nil, "BACKGROUND")
+        ring:SetAllPoints()
+        ring:SetColorTexture(1, 1, 1, 0.9)
+        ring:Hide()
+        b.ring  = ring
+        b.value = s.value
+
+        b:SetScript("OnClick", function()
+            store[key] = s.value
+            if onChange then onChange() end
+            ns.RefreshOptions()
+        end)
+
+        buttons[i] = b
+    end
+
+    local holder = CreateFrame("Frame", nil, parent)
+    holder.Refresh = function()
+        local cur = store[key] and string.lower(store[key]) or ""
+        for _, b in ipairs(buttons) do b.ring:SetShown(cur == b.value) end
+    end
+    Add(holder)
+
+    return y - 46
+end
+
+-- Several short text fields on a single line. Glyphs are chosen against
 -- each other -- the whole point is that the silhouettes stay distinct -- so
 -- they belong side by side, and a column has no vertical room for three
 -- stacked fields anyway.
@@ -354,7 +411,8 @@ function ui.InputRow(parent, x, y, text, store, specs, onChange)
         eb:SetSize(bw - 14, 20)
         eb:SetPoint("TOPLEFT", bx + 6, y - 31)
         eb:SetAutoFocus(false)
-        eb:SetMaxLetters(8)
+        -- Room for the longest raid-marker name, `{triangle}`.
+        eb:SetMaxLetters(12)
         eb:SetFontObject("GameFontHighlight")
 
         local function commit()

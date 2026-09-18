@@ -22,6 +22,23 @@ EVENT_ATTEMPTS = {}
 -- function that closes over it.
 local SECRET = setmetatable({}, { __tostring = function() return "secret" end })
 
+-- Secrets that carry a value the addon cannot read but the client can. SECRET
+-- above is opaque all the way down; these exist for the one path where the
+-- client *uses* the hidden answer on the addon's behalf -- SetAlphaFromBoolean
+-- -- so a suite can assert what the player would see without the addon ever
+-- having been able to read it.
+local secretPayload = setmetatable({}, { __mode = "k" })
+function MakeSecret(v)
+    local s = setmetatable({}, { __tostring = function() return "secret" end })
+    secretPayload[s] = { v }
+    return s
+end
+local function Reveal(s)
+    local p = type(s) == "table" and secretPayload[s]
+    if p then return true, p[1] end
+    return false
+end
+
 local function NewRegion(kind, parent)
     local r = {
         _type = kind, _text = "", _shown = true, _alpha = 1,
@@ -54,8 +71,29 @@ local function NewRegion(kind, parent)
     function r:SetShown(v) self._shown = v and true or false end
     function r:IsShown() return self._shown end
     function r:IsVisible() return self._shown end
-    function r:SetAlpha(v) self._alpha = v end
-    function r:GetAlpha() return self._alpha end
+    function r:SetAlpha(v) self._alpha = v; self._seenAlpha = v end
+    function r:GetAlpha()
+        if self._alphaSecret then return SECRET end
+        return self._alpha
+    end
+    -- The one door a tainted addon has for drawing from a secret boolean.
+    -- Modelled with the side effect the real client declares
+    -- (SecretArgumentsAddAspect): once a secret has gone through, this frame's
+    -- alpha is secret for good, and a later SetAlpha does not clear it.
+    --
+    -- `_seenAlpha` is what the player sees, which the client knows even when
+    -- the addon does not: nil for a fully opaque SECRET, the resolved alpha
+    -- for a MakeSecret one. Only suites read it.
+    function r:SetAlphaFromBoolean(v, ifTrue, ifFalse)
+        if issecretvalue(v) then
+            self._alphaSecret = true
+            local known, b = Reveal(v)
+            self._seenAlpha = known and (b and ifTrue or ifFalse) or nil
+        else
+            self._alpha = v and ifTrue or ifFalse
+            self._seenAlpha = self._alpha
+        end
+    end
     function r:SetPoint(...) self._points[#self._points + 1] = { ... } end
     function r:ClearAllPoints() self._points = {} end
     function r:SetAllPoints() end
@@ -350,9 +388,19 @@ end
 
 function wipe(t) for k in pairs(t) do t[k] = nil end return t end
 
+-- Both doors count into the same total; LAST_SOUND records which door and what
+-- went through it, so a suite can tell "the chosen sound" from "a sound".
 SOUNDKIT = { RAID_WARNING = 1 }
 SOUNDS_PLAYED = 0
-function PlaySound() SOUNDS_PLAYED = SOUNDS_PLAYED + 1 end
+LAST_SOUND = nil
+function PlaySound(id, channel)
+    SOUNDS_PLAYED = SOUNDS_PLAYED + 1
+    LAST_SOUND = { kit = id, channel = channel }
+end
+function PlaySoundFile(id, channel)
+    SOUNDS_PLAYED = SOUNDS_PLAYED + 1
+    LAST_SOUND = { file = id, channel = channel }
+end
 
 -- GameTooltip, enough of it to see what a hover asked for.
 GameTooltip = {
@@ -441,7 +489,9 @@ WORLD = {
     units        = {},
 }
 
-function issecretvalue(v) return v == SECRET end
+function issecretvalue(v)
+    return v == SECRET or (type(v) == "table" and secretPayload[v] ~= nil)
+end
 
 -- A secret value a suite can hand to the addon directly. Some of what the
 -- addon reads never comes out of a Unit* call at all -- the aura tables on
@@ -487,21 +537,32 @@ end
 -- Field positions match the real API exactly (a cast carries castID, a
 -- channel does not, which shifts notInterruptible and spellID back by one),
 -- because ImportantCasts.lua reads them by position rather than reaching past
--- them with select(). notInterruptible is the one value that goes secret
--- under WORLD.secretMode -- the name and spellID stay plain, which is why a
--- cast bar works at all inside an instance.
+-- them with select().
+--
+-- Under WORLD.secretMode everything goes secret except what the client
+-- declares NeverSecret -- isTradeskill among them, which is what makes "is
+-- this unit casting at all" answerable inside an instance. This used to leave
+-- the name and spell ID plain, on the belief that a cast bar needs them; the
+-- generated docs say otherwise (SecretWhenUnitSpellCastRestricted), and a
+-- harness that believed it passed while the marker was dead in every dungeon.
 function UnitCastingInfo(u)
     local d = U(u); if not d or not d.cast or d.cast.channel then return nil end
     local c = d.cast
     local notInterruptible = c.notInterruptible or false
-    if WORLD.secretMode then notInterruptible = SECRET end
+    if WORLD.secretMode then
+        return SECRET, SECRET, SECRET, SECRET, SECRET, false, SECRET, SECRET,
+               MakeSecret(c.spellId)
+    end
     return c.name, "", c.icon, 0, 0, false, 1, notInterruptible, c.spellId
 end
 function UnitChannelInfo(u)
     local d = U(u); if not d or not d.cast or not d.cast.channel then return nil end
     local c = d.cast
     local notInterruptible = c.notInterruptible or false
-    if WORLD.secretMode then notInterruptible = SECRET end
+    if WORLD.secretMode then
+        return SECRET, SECRET, SECRET, SECRET, SECRET, false, SECRET,
+               MakeSecret(c.spellId)
+    end
     return c.name, "", c.icon, 0, 0, false, notInterruptible, c.spellId
 end
 function UnitIsUnit(a, b)
@@ -681,12 +742,17 @@ C_Spell = {
         SPELL_REQUESTS[#SPELL_REQUESTS + 1] = id
     end,
     -- Modelled as a secret boolean under WORLD.secretMode, same as the real
-    -- client -- ImportantCasts.lua must never branch on it directly and this
-    -- is what proves that.
+    -- client: it accepts a secret spell ID (AllowedWhenTainted) and answers
+    -- with a secret that still carries the true answer, which only
+    -- SetAlphaFromBoolean can act on. ImportantCasts.lua must never branch on
+    -- it, and the suite checking what the player *sees* is what proves that.
     IsSpellImportant = function(id)
-        if WORLD.secretMode then return SECRET end
+        local hidden, real = Reveal(id)
+        if hidden then id = real end
         local s = SPELLDB[id]
-        return (s and s.important) and true or false
+        local answer = (s and s.important) and true or false
+        if WORLD.secretMode or hidden then return MakeSecret(answer) end
+        return answer
     end,
 }
 

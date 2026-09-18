@@ -15,8 +15,16 @@ the debuff journal.
 
 When something renders nothing, throws only inside an instance, or works
 outdoors but not in a raid, read the `restriction-casebook` skill before
-debugging — it holds the solved cases and the method for telling the three kinds
+debugging — it holds the solved cases and the method for telling the four kinds
 of refusal apart. Add a case to it when a new one is solved.
+
+Before writing code against a client API this repo has not used yet, send the
+`wow-api` agent. It searches the API export taken from the live client
+(`../wow-api-docs/<build>/`) and the hundred-odd addons installed on this machine
+first, and goes to Blizzard's UI source on GitHub and warcraft.wiki.gg only for
+what those do not settle — then reports back with a verdict on whether the approach
+survives the restrictions. Answering an API question from memory is how most of
+the cases in the casebook got written.
 
 ## Commands
 

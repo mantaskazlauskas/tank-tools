@@ -71,6 +71,7 @@ the question you have, extending it is usually the actual fix.
 | a fallback that is empty in the content it exists for | [both doors can shut at the same time](cases.md#both-doors-can-shut-at-the-same-time) |
 | markers missing after a zone change, never recovering | [a blind wipe drops plates whose ADDED already fired](cases.md#a-blind-wipe-drops-plates-whose-added-already-fired) |
 | "action blocked" only after a pull starts; fine at a dummy | [combat is a fourth kind of refusal](cases.md#combat-is-a-fourth-kind-of-refusal-and-it-is-scoped-to-time) |
+| a feature that works outdoors and silently does nothing in any instance | [a fail-closed check on a secret boolean switches the feature off where it matters](cases.md#a-fail-closed-check-on-a-secret-boolean-switches-the-feature-off-where-it-matters) |
 
 ## Adding a case
 

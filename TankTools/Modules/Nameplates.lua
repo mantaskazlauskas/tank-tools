@@ -408,7 +408,7 @@ function ns.RefreshMarkers()
                 m._kind   = kind
                 m._serial = looksSerial
                 ApplyLook(m, m:GetParent())
-                m.text:SetText(db[k.glyph] or "")
+                m.text:SetText(ns.GlyphMarkup(db[k.glyph]))
                 local c = db[k.color] or db.npColor
                 m.text:SetTextColor(c[1], c[2], c[3])
             end
@@ -686,9 +686,10 @@ local function GlyphCommand(name, order, key, desc)
             if arg and arg ~= "" then
                 db[key] = arg
                 ns.MarkersLooksChanged()
-                Print("symbol set to \"" .. arg .. "\".")
+                Print("symbol set to " .. ns.GlyphMarkup(arg) .. ".")
             else
-                Print("usage: /tt " .. name .. " <text>")
+                Print("usage: /tt " .. name .. " <text>, or a raid marker "
+                      .. "such as {skull}, {cross}, {star}")
             end
         end,
     }
@@ -778,6 +779,12 @@ ns.RegisterOptionsSection{
             { label = "At risk",  key = "npWarnGlyph"   },
             { label = "Mine",     key = "npSecureGlyph" },
         }, apply)
+        y = ui.Symbols(f, x, y, "Or an icon -- not mine", db, "npGlyph", apply)
+        y = ui.Symbols(f, x, y, "Or an icon -- at risk", db, "npWarnGlyph", apply)
+        y = ui.Symbols(f, x, y, "Or an icon -- mine", db, "npSecureGlyph", apply)
+        y = ui.Note(f, x, y,
+            "Icons keep their own colors; the colors below tint text\n"
+            .. "symbols only. {skull} typed in a box works too.")
         y = ui.Swatches(f, x, y, "Alert color", db, "npColor", apply, ns.COLOR_ORDER)
         y = ui.Swatches(f, x, y, "Aggro color", db, "npSecureColor", apply,
                         ns.COLOR_ORDER_SECURE)
