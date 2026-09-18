@@ -6,5 +6,6 @@ settings.json
 .zoo
 .venv/
 
-# Machine-specific: the WoW install path differs per person.
-.claude/settings.local.json
+# Claude Code instructions, agents, hooks and skills stay local to this machine.
+CLAUDE.md
+.claude/
