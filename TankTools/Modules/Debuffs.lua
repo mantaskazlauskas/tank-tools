@@ -12,46 +12,32 @@
 -- has one. This is how the list gets built: play, then read back what actually
 -- happened to you.
 --
--- TWO DOORS, BECAUSE ONE OF THEM IS SHUT WHERE IT MATTERS
+-- TWO DOORS
 --
--- The obvious source is the aura data itself: UNIT_AURA hands over an AuraData
--- table per added aura, with every flag on it. That is the rich door, and it
--- is the one that closes. Inside an encounter or a Mythic+ the client refuses
--- aura reads -- exactly the content whose debuffs are worth cataloguing. See
--- ns.AurasRestricted in Core/Secret.lua.
+-- The aura data itself: UNIT_AURA hands over an AuraData table per added aura,
+-- with every flag on it. That is the rich door, and it narrows where it
+-- matters: inside an encounter or a Mythic+ the client refuses aura
+-- enumeration (see ns.AurasRestricted in Core/Secret.lua). The added-aura list
+-- still arrives there -- it is pushed, not enumerated -- so records still land,
+-- just fewer of them.
 --
--- So the combat log is read too. SPELL_AURA_APPLIED carries a spell id and the
--- word DEBUFF, and it is a log line rather than a unit read: a different
--- permission, and one that is still open where the first is not. It says far
--- less -- an id and a name, no flags at all. That is enough to key a record
--- on, and the spell database fills in the name and the icon for nothing,
--- because asking what spell 12345 is called is not a question about a unit.
+-- And the Encounter Journal, further down: what a boss can do, learned at the
+-- pull or pre-filled for a whole expansion, before anything has landed.
 --
--- The two doors are not interchangeable, so a record says which one it came
--- through. A journal that quietly filed half a raid's debuffs as "not
--- dispellable, not a raid aura" because it never got to look would be worse
--- than one that admits it does not know.
+-- THERE USED TO BE A THIRD
 --
--- ...AND THE SECOND DOOR IS NOT GUARANTEED EITHER
---
--- The paragraph above was written when registering for the combat log was
--- something any addon could simply do. It is not: on a client that protects
--- COMBAT_LOG_EVENT_UNFILTERED the registration is refused, so the fallback for
--- a shut aura door can itself be shut.
---
--- And it is refused in the worst way available. Nothing raises. The client
--- fires ADDON_ACTION_FORBIDDEN -- which an error display will show the player
--- -- then leaves the event unregistered and returns as if it had worked. A
--- pcall around it catches nothing and reports success. That is why
--- ns.RegisterEvent checks IsEventRegistered afterwards rather than trusting
--- the call, and why this module records the refusal instead of rediscovering
--- it every login: the attempt is what the client reports, so the only way to
--- stop reporting it is to stop attempting.
+-- The combat log (SPELL_AURA_APPLIED) was read too, as the door that stays
+-- open in an encounter. It was removed. On a client that protects
+-- COMBAT_LOG_EVENT_UNFILTERED the registration is refused, and the refusal is
+-- shown to the player as ADDON_ACTION_FORBIDDEN -- an error on screen at
+-- startup, which remembering the refusal per patch did not stop in practice.
+-- A journal that is thinner inside encounters is the better trade. Records it
+-- wrote before then keep via = "log" and still read as "log only".
 --
 -- NOTHING HERE IS READ RAW
 --
--- Every value off an aura table or a log line goes through Clean() before it
--- is compared, formatted or used as a table key. A flag that comes back
+-- Every value off an aura table goes through Clean() before it is compared,
+-- formatted or used as a table key. A flag that comes back
 -- unreadable leaves the record's field alone rather than writing false into
 -- it, so a fact learned in a delve survives a raid where it could not be
 -- checked.
@@ -92,7 +78,6 @@ local M = ns.NewModule("debuffs", {
     feature  = "debuffs",
     defaults = {
         djRecord  = true,
-        djFromLog = true,
         -- The Encounter Journal door. On by default because it is the only one
         -- that answers regardless of who the debuff lands on, and because it
         -- asks the client nothing it could refuse -- content data, not a unit
@@ -107,16 +92,19 @@ local M = ns.NewModule("debuffs", {
         -- only table default in the addon that is not a colour triple, and the
         -- settings window never edits it -- the journal window does.
         djSeen    = {},
-        -- djLogRefusedOn is deliberately absent, like twPoint in TankWatch: it
-        -- is written only if the client actually refuses the combat log, and
-        -- its value is the interface version that refused. Absent means "never
-        -- been told no", which is the right thing for a fresh database to
-        -- believe.
+        -- The pre-filled catalog: every boss ability of the current expansion,
+        -- read out of the Encounter Journal on request. Kept apart from djSeen
+        -- so it never counts against the journal's cap and never evicts a
+        -- real sighting -- see "The catalog" below. Shaped
+        -- { entries = { [spellID] = entry }, tier =, built =, ... } once built;
+        -- empty until then, for the same CopyDefault reason as djSeen.
+        djCatalog = {},
     },
 })
 
 local db      -- resolved in OnInit
 local seen    -- db.djSeen
+local catalog -- db.djCatalog
 
 -- A record has changed since the window last drew. Batched onto a ticker
 -- rather than redrawn per event: a fast-ticking debuff refreshes several times
@@ -124,26 +112,6 @@ local seen    -- db.djSeen
 local dirty = false
 
 local lastScan = 0
-
--- Our own GUID, laundered once per zone. nil no longer shuts the combat log
--- door on its own -- destFlags attributes our own lines without any identity
--- at all, see Recordable() -- but it is still the only way to recognise a
--- co-tank's line, so the status command reports it.
-local myGUID
-
--- Set once a log line has actually been attributed by its affiliation flags.
--- The status line says "not yet" rather than "no": the mask cannot be tested
--- until a line arrives, and calling the door shut before then would be a guess.
-local sawMineFlag = false
-
--- Co-tank GUIDs, rebuilt with the roster. Only the readable ones go in, so an
--- entry here is a co-tank we can positively recognise; one whose GUID came
--- back secret is simply absent and counted in `blindTanks` instead. Two
--- numbers rather than one, because "no co-tanks" and "co-tanks we are not
--- allowed to identify" are different answers and only one of them is a reason
--- to stop expecting records.
-local tankGUIDs  = {}
-local blindTanks = 0
 
 -- Auras that reached us and could not be identified. The whole point of
 -- counting them is that they are invisible otherwise: an aura the client will
@@ -164,34 +132,13 @@ local journalIDs   = 0
 local journalTried = false
 local journalErr
 
-local function TankGUIDCount()
-    local n = 0
-    for _ in pairs(tankGUIDs) do n = n + 1 end
-    return n
-end
+-- Encounters already walked this session, so a wipe and a re-pull does not
+-- redo the whole tree. Keyed by dungeon encounter id. Up here rather than
+-- beside the walk because clearing the journal has to reset it too.
+local journalDone = {}
 
--- Whether each door has actually produced anything this session. Between them
--- they explain every empty journal there is.
-local sawAura, sawLog = false, false
-
--- Whether the client let us register for the combat log at all. False is not
--- "we saw nothing on it" -- it is a door that was never opened, and the one
--- explanation for a thin journal that no amount of playing will change.
-local logAllowed = false
-
--- True when we did not even ask, because a previous session was refused on
--- this same client build. Kept apart from logAllowed so the status line can
--- tell "it said no" from "we took its word for it".
-local logRemembered = false
-
--- The interface version, which changes every patch. Used only to date a
--- remembered refusal: it is the soonest the answer could change, so it is the
--- soonest worth asking again.
-local function ClientBuild()
-    if not GetBuildInfo then return 0 end
-    local ok, _, _, _, toc = pcall(GetBuildInfo)
-    return (ok and type(toc) == "number") and toc or 0
-end
+-- Whether the aura door has actually produced anything this session.
+local sawAura = false
 
 --------------------------------------------------------------------------------
 -- Writing a record
@@ -276,11 +223,10 @@ local function FillFromSpellbook(r)
     if not r.icon and info.iconID then r.icon = info.iconID end
 end
 
--- `via` is the door: "aura" when we got to read the aura table, "log" when all
--- we had was a combat log line. A record only ever moves up -- once a debuff
--- has been seen properly it stays marked that way, because the flags on it
--- were read properly too.
-local function Touch(id, via)
+-- A sighting. Only the aura door calls this now, so a sighting always makes
+-- the record an aura record -- which is also how a journal entry ("not seen
+-- yet") or an old combat-log one is upgraded the first time it really lands.
+local function Touch(id)
     local r = seen[id]
     local fresh = false
     if not r then
@@ -291,11 +237,7 @@ local function Touch(id, via)
 
     r.n    = r.n + 1
     r.last = Now()
-    if via == "aura" then
-        r.via = "aura"
-    elseif r.via == nil then
-        r.via = "log"
-    end
+    r.via  = "aura"
 
     -- After the record is filled in, not before: Prune sorts on `last`, and a
     -- record it found half built would take the comparison down. And only for
@@ -348,7 +290,7 @@ local function FromAura(a, harmful)
         return
     end
 
-    local r = Touch(id, "aura")
+    local r = Touch(id)
     sawAura = true
 
     local name = Clean(a.name)
@@ -492,20 +434,49 @@ local SORTS = {
 -- cannot happen underneath a redraw.
 --
 -- `query` matches the name or the spell id, case insensitively -- a number
--- typed into the box finds an id you half remember.
-function ns.DebuffRecords(query, sort)
+-- typed into the box finds an id you half remember -- and, for a boss ability,
+-- the encounter and the instance (not `boss`, which is the boss-aura flag), so typing a dungeon's name lists its abilities.
+--
+-- `withCatalog` adds the pre-filled boss abilities that are not in the journal
+-- yet. They come back as fresh view rows, never the catalog's own tables, and
+-- with `last = 0` so a "recent" sort puts everything you actually met first.
+local function CatalogCount()
+    local n = 0
+    if catalog and catalog.entries then
+        for _ in pairs(catalog.entries) do n = n + 1 end
+    end
+    return n
+end
+
+local function Matches(query, r)
+    if query == "" then return true end
+    return strlower(r.name or ""):find(query, 1, true) ~= nil
+           or tostring(r.id):find(query, 1, true) ~= nil
+           or strlower(r.encounter or ""):find(query, 1, true) ~= nil
+           or strlower(r.instance or ""):find(query, 1, true) ~= nil
+end
+
+function ns.DebuffRecords(query, sort, withCatalog)
     local out = {}
     if not seen then return out end
 
     query = (type(query) == "string") and strlower(strtrim(query)) or ""
 
     for _, r in pairs(seen) do
-        local keep = (query == "")
-        if not keep then
-            keep = strlower(r.name or ""):find(query, 1, true) ~= nil
-                   or tostring(r.id):find(query, 1, true) ~= nil
+        if Matches(query, r) then out[#out + 1] = r end
+    end
+
+    local entries = withCatalog and catalog and catalog.entries
+    if entries then
+        for id, c in pairs(entries) do
+            if not seen[id] then
+                local v = { id = id, name = c.name, icon = c.icon, n = 0, last = 0,
+                            via = "journal", encounter = c.encounter, instance = c.instance,
+                            dispel = c.dispel, tank = c.tank, bleed = c.bleed,
+                            catalog = true }
+                if Matches(query, v) then out[#out + 1] = v end
+            end
         end
-        if keep then out[#out + 1] = r end
     end
 
     tsort(out, SORTS[sort] or SORTS.recent)
@@ -521,27 +492,7 @@ function ns.DebuffStats()
     return {
         total      = n,
         recording  = db and db.djRecord and true or false,
-        fromLog    = db and db.djFromLog and true or false,
         restricted = ns.AurasRestricted(),
-        -- Two different ways the log door is shut, and they want different
-        -- answers: the client refused the registration, or it let us listen
-        -- but will not tell us which lines are ours.
-        logAllowed = logAllowed,
-        -- We did not ask this session: a previous one was refused on this same
-        -- client build. Not the same fact as "it said no", and the difference
-        -- is the one that tells you /tt debuffs log exists.
-        logRemembered = logRemembered,
-        -- Open when there is any way at all to tell our own lines apart. The
-        -- flag route needs no identity and so survives an encounter, which is
-        -- why this is no longer just "do we have a GUID".
-        logOpen    = (myGUID ~= nil) or sawMineFlag,
-        selfByFlag = sawMineFlag,
-        -- Co-tanks we hold a usable GUID for, and co-tanks the client would
-        -- not name. The second number is the one worth printing: it is the
-        -- whole reason a raid night can end with a journal full of your own
-        -- debuffs and none of the other tank's.
-        tanksKnown = TankGUIDCount(),
-        tanksBlind = blindTanks,
         -- Auras that arrived and could not be identified. Non-zero is the
         -- answer to "the panel is drawing them, why is the journal empty".
         unnamed    = unnamedAuras,
@@ -554,8 +505,14 @@ function ns.DebuffStats()
         journalTried = journalTried,
         journalErr  = journalErr,
         sawAura    = sawAura,
-        sawLog     = sawLog,
         cap        = MAX_RECORDS,
+        -- The pre-filled catalog: how many boss abilities, from which
+        -- expansion, and when it was built. Zero entries and no `built` is
+        -- "never pre-filled", not "pre-filled and found nothing".
+        catalog          = CatalogCount(),
+        catalogTier      = catalog and catalog.tier or nil,
+        catalogBuilt     = catalog and catalog.built or nil,
+        catalogInstances = catalog and catalog.instances or 0,
     }
 end
 
@@ -574,6 +531,35 @@ function ns.ForgetDebuffs()
     end
     dirty = true
     return n
+end
+
+-- The whole slate: every record marked or not, and the pre-filled catalog.
+-- ForgetDebuffs above is for clutter and keeps what you decided; this is for
+-- starting the list over, so it takes the decisions with it. Returns how many
+-- records and how many catalog entries went.
+--
+-- The co-tank row is told, because the marks it filters by just vanished.
+function ns.ClearDebuffJournal()
+    local records, entries = 0, 0
+    if seen then
+        for id in pairs(seen) do
+            seen[id] = nil
+            records = records + 1
+        end
+    end
+    if catalog then
+        entries = CatalogCount()
+        for k in pairs(catalog) do catalog[k] = nil end
+    end
+    -- A boss already walked this session would otherwise not be learned
+    -- again at its next pull, and the list would stay empty for a reason
+    -- nobody can see.
+    for k in pairs(journalDone) do journalDone[k] = nil end
+    journalIDs = 0
+
+    dirty = true
+    if ns.TankWatchLooksChanged then ns.TankWatchLooksChanged() end
+    return records, entries
 end
 
 --------------------------------------------------------------------------------
@@ -596,6 +582,19 @@ function ns.SetDebuffMark(id, mark)
     if mark ~= nil and not MARKS[mark] then return end
 
     local r = seen and seen[id]
+    -- A catalog entry has no record to carry a mark, so marking one writes it
+    -- into the journal first -- and a marked record is never evicted, so the
+    -- decision outlives the next rebuild of the catalog it came from.
+    if not r and mark ~= nil then
+        local c = catalog and catalog.entries and catalog.entries[id]
+        if c then
+            r = { id = id, n = 0, first = Now(), last = Now(), via = "journal",
+                  name = c.name, icon = c.icon, encounter = c.encounter,
+                  instance = c.instance, dispel = c.dispel, tank = c.tank,
+                  bleed = c.bleed }
+            seen[id] = r
+        end
+    end
     if not r or r.mark == mark then return end
 
     r.mark = mark
@@ -633,136 +632,17 @@ function ns.DebuffMarkCounts()
 end
 
 --------------------------------------------------------------------------------
--- Recording
---------------------------------------------------------------------------------
-
-local LOG_EVENTS = {
-    SPELL_AURA_APPLIED      = true,
-    SPELL_AURA_APPLIED_DOSE = true,
-    SPELL_AURA_REFRESH      = true,
-}
-
--- WHO A LOG LINE IS ABOUT, WITHOUT ASKING WHO ANYBODY IS
+-- The second door: the Encounter Journal
 --
--- The GUID compare below used to be the only test, and it is the reason the
--- journal was thinnest in exactly the content worth cataloguing. `myGUID` is
--- UnitGUID("player") laundered, and inside an instance that is a secret --
--- so myGUID is nil, every line is unattributable, and the log door shuts on
--- its own in the one place the aura door is already shut.
---
--- destFlags is the way out. It is a bitmask on a log line rather than an
--- answer about a unit -- a different permission, the same one that lets the
--- log be read at all -- and its affiliation bits say MINE without anybody's
--- identity being involved. That covers the player everywhere, encounter
--- included.
---
--- It does NOT cover co-tanks. The mask distinguishes mine / party / raid /
--- outsider and has no notion of role, so "is this line about a tank" still
--- needs a GUID, and a GUID is what an encounter takes away. Co-tank lines are
--- therefore attributed where identity is readable and not at all where it is
--- not -- reported by /tt status rather than left as a mystery, because a
--- silently tank-blind journal is the bug this whole change is fixing.
-local AFFILIATION_MINE = 0x00000001
-
-local function RebuildTankGUIDs()
-    for k in pairs(tankGUIDs) do tankGUIDs[k] = nil end
-    blindTanks = 0
-
-    if not (UnitGUID and ns.tankUnits) then return end
-    for i = 1, #ns.tankUnits do
-        local u = ns.tankUnits[i]
-        if u ~= "player" then
-            local g = Clean(UnitGUID(u))
-            if type(g) == "string" then tankGUIDs[g] = true
-            else blindTanks = blindTanks + 1 end
-        end
-    end
-end
-
--- True when this line is about somebody the journal records: us, or a co-tank
--- we can still recognise.
---
--- Ordered by cost and by certainty. The flag test is arithmetic on a number we
--- already have; the GUID compares need a table lookup and can only run at all
--- when the client is still naming people.
-local function Recordable(destFlags, dest)
-    local f = Clean(destFlags)
-    if type(f) == "number" and f % (AFFILIATION_MINE * 2) >= AFFILIATION_MINE then
-        sawMineFlag = true
-        return true
-    end
-
-    if type(dest) ~= "string" then return false end
-    if myGUID and dest == myGUID then return true end
-    return tankGUIDs[dest] == true
-end
-
--- The combat log handler, and the one hot path in this file: it runs on every
--- line of the log, which in a raid is thousands a second.
---
--- So it is ordered by how cheaply each test rejects. The subevent is looked at
--- first and throws out almost everything; attribution runs only for the
--- handful of lines that survive that.
---
--- Nothing is used as a table key before it has been laundered and type
--- checked. A secret used as a key throws, and a handler that throws on every
--- log line is one the event dispatcher stops within five of them.
-local function OnCombatLog()
-    if not (db.djRecord and db.djFromLog) then return end
-    if not CombatLogGetCurrentEventInfo then return end
-
-    local _, sub, _, _, _, _, _, destGUID, _, destFlags, _,
-          spellId, spellName, _, auraType = CombatLogGetCurrentEventInfo()
-
-    sub = Clean(sub)
-    if type(sub) ~= "string" or not LOG_EVENTS[sub] then return end
-
-    if Clean(auraType) ~= "DEBUFF" then return end
-
-    if not Recordable(destFlags, Clean(destGUID)) then return end
-
-    local id = Clean(spellId)
-    if type(id) ~= "number" then return end
-
-    local r = Touch(id, "log")
-    sawLog = true
-
-    local name = Clean(spellName)
-    if not r.name and type(name) == "string" and name ~= "" then r.name = name end
-    FillFromSpellbook(r)
-end
-
--- Forget a remembered refusal and ask the client again, right now.
---
--- For the case the refusal was situational after all -- reloading inside an
--- encounter, say -- or Blizzard relented mid-patch. Nobody should have to edit
--- a saved variables file to ask a question that costs one call.
---
--- Returns early when the door is already open: registering the same handler
--- twice would file every log line as two sightings.
-function ns.RetryDebuffLog()
-    if not db then return false end
-
-    db.djLogRefusedOn = nil
-    logRemembered = false
-    if logAllowed then return true end
-
-    logAllowed = ns.RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED", OnCombatLog)
-    if not logAllowed then db.djLogRefusedOn = ClientBuild() end
-    return logAllowed
-end
-
---------------------------------------------------------------------------------
--- The third door: the Encounter Journal
---
--- The other two doors record what LANDED. This one records what the boss can
--- do, which is a different fact and worth keeping apart.
+-- The aura door records what LANDED. This one records what the boss can do,
+-- which is a different fact and worth keeping apart.
 --
 -- It works in an encounter for the same reason the spell database does: the
 -- Dungeon Journal is the game's own content data, not an answer about a unit,
 -- so nothing here is restricted and nothing needs laundering. That is the
 -- whole appeal -- it is the only door that stays open regardless of who the
--- debuff lands on, which is exactly the gap the other two leave.
+-- debuff lands on, which is exactly the gap the aura door leaves in an
+-- encounter.
 --
 -- WHAT IT IS NOT
 --
@@ -786,16 +666,83 @@ end
 -- here so that a malformed sibling link cannot hang the client mid-pull.
 local MAX_SECTIONS = 400
 
--- Encounters already walked this session, so a wipe and a re-pull does not
--- redo the whole tree. Keyed by dungeon encounter id.
-local journalDone = {}
 
 -- A record the journal contributed. Deliberately NOT Touch(): that counts a
 -- sighting, and nothing here has been seen.
 --
 -- An existing record is only ever filled in, never downgraded -- if a debuff
 -- has actually landed on you, that is the better fact and it stays.
-local function FromJournal(id, name, icon)
+-- WHICH ABILITIES ARE DEBUFFS
+--
+-- The journal lists every ability a boss has -- casts, adds, frontals,
+-- enrages -- and nothing on a spell says "this one leaves a debuff on you".
+-- What the journal does carry is the row of little icons beside each ability
+-- in the Adventure Guide (Enum.JournalEncounterIconFlags), and six of them
+-- mean a debuff a tank cares about: the four dispel types, Bleed, and the Tank
+-- alert, which is how the journal marks a tank buster. Those are kept; every
+-- other ability is not written down.
+--
+-- Two limits, stated rather than hidden. Magic is also how the journal tags a
+-- purgeable buff on the boss, so one of those can get through. And the journal
+-- lists the spell a boss *casts*, which is not always the id of the debuff it
+-- leaves -- a real sighting records the real id when it lands.
+--
+-- GetSectionIconFlags returns icon *indices*, not flag values: the index is
+-- the flag's bit position, which is how Blizzard's own journal maps them
+-- (GetIconFlagIndices in Blizzard_EncounterJournal.lua). Derived from the enum
+-- when there is one, so a renumbering follows along.
+local function BitIndex(v, fallback)
+    if type(v) ~= "number" or v < 1 then return fallback end
+    local i = 0
+    while v > 1 do v = v / 2; i = i + 1 end
+    return i
+end
+
+local ICON = (Enum and Enum.JournalEncounterIconFlags) or {}
+-- The fallbacks are today's bit positions, for a client with no enum.
+local DEBUFF_ICONS = {
+    [BitIndex(ICON.Tank,    0)]  = "tank",
+    [BitIndex(ICON.Magic,   7)]  = "Magic",
+    [BitIndex(ICON.Curse,   8)]  = "Curse",
+    [BitIndex(ICON.Poison,  9)]  = "Poison",
+    [BitIndex(ICON.Disease, 10)] = "Disease",
+    [BitIndex(ICON.Bleed,   13)] = "bleed",
+}
+
+-- The tags that make a section worth keeping, as record fields -- `dispel`,
+-- `tank`, `bleed`, the same names the aura door fills in -- or nil when the
+-- section carries none of them. A client without the call keeps everything,
+-- which is how the journal behaved before it could tell: an unfiltered list
+-- is recoverable by reading it, an empty one is not.
+local function DebuffTags(sectionID)
+    local get = C_EncounterJournal and C_EncounterJournal.GetSectionIconFlags
+    if not get then return {} end
+    local ok, flags = pcall(get, sectionID)
+    if not ok or type(flags) ~= "table" then return nil end
+
+    local tags
+    for _, index in ipairs(flags) do
+        local tag = DEBUFF_ICONS[index]
+        if tag then
+            tags = tags or {}
+            if tag == "tank" then tags.tank = true
+            elseif tag == "bleed" then tags.bleed = true
+            else tags.dispel = tag end
+        end
+    end
+    return tags
+end
+
+local function ApplyTags(r, tags)
+    if tags.dispel and r.dispel == nil then r.dispel = tags.dispel end
+    if tags.tank and r.tank == nil then r.tank = true end
+    if tags.bleed then r.bleed = true end
+end
+
+local function FromJournal(id, name, icon, sectionID)
+    local tags = DebuffTags(sectionID)
+    if not tags then return end
+
     local r = seen[id]
     if not r then
         r = { id = id, n = 0, first = Now(), last = Now(), via = "journal" }
@@ -805,6 +752,9 @@ local function FromJournal(id, name, icon)
 
     if not r.name and type(name) == "string" and name ~= "" then r.name = name end
     if not r.icon and icon then r.icon = icon end
+    -- Only fills gaps: a flag the aura door actually read wins over the
+    -- journal's tag for the same spell.
+    ApplyTags(r, tags)
     FillFromSpellbook(r)
 
     dirty = true
@@ -815,7 +765,11 @@ end
 -- Iterative rather than recursive: the tree is client data and a sibling link
 -- that points back up it would take the stack down, where a visit budget just
 -- stops.
-local function WalkSections(rootID)
+--
+-- `sink(spellID, title, icon, sectionID)` is where each ability goes: the journal at the
+-- pull, the catalog when pre-filling. Same walk, two destinations.
+local function WalkSections(rootID, sink)
+    sink = sink or FromJournal
     local GetSection = C_EncounterJournal and C_EncounterJournal.GetSectionInfo
     if not GetSection then return 0, "this client has no GetSectionInfo" end
 
@@ -833,7 +787,7 @@ local function WalkSections(rootID)
                 -- A section is either an ability or a heading that holds them,
                 -- and only the first kind has a spell.
                 if type(s.spellID) == "number" and s.spellID > 0 then
-                    FromJournal(s.spellID, s.title, s.abilityIcon)
+                    sink(s.spellID, s.title, s.abilityIcon, id)
                     found = found + 1
                 end
                 stack[#stack + 1] = s.siblingSectionID
@@ -853,13 +807,31 @@ end
 -- Journal is showing. Silently repointing a window the player has open is not
 -- a thing an addon should do to look up a spell id, so the mutating call is
 -- only a fallback for a client whose API does not take the argument.
+-- The journal instance you are standing in.
+--
+-- Not EJ_GetCurrentInstance: that was removed in 8.0.1, and for as long as this
+-- file called it the pull-time door answered "no Encounter Journal API" on
+-- every live client -- the harness defined the function, so the suite never
+-- noticed. This is the route Blizzard's own AdventureGuideUtil takes: the game
+-- map id from GetInstanceInfo, mapped to the journal's own instance id.
+local function CurrentJournalInstance()
+    if not (GetInstanceInfo and C_EncounterJournal
+            and C_EncounterJournal.GetInstanceForGameMap) then
+        return nil
+    end
+    local mapID = Clean(select(8, GetInstanceInfo()))
+    if type(mapID) ~= "number" then return nil end
+    local ok, id = pcall(C_EncounterJournal.GetInstanceForGameMap, mapID)
+    return (ok and type(id) == "number" and id ~= 0) and id or nil
+end
+
 local function FindEncounter(dungeonEncounterID)
-    if not (EJ_GetCurrentInstance and EJ_GetEncounterInfoByIndex) then
+    if not EJ_GetEncounterInfoByIndex then
         return nil, "this client has no Encounter Journal API"
     end
 
-    local okInst, instanceID = pcall(EJ_GetCurrentInstance)
-    if not okInst or type(instanceID) ~= "number" or instanceID == 0 then
+    local instanceID = CurrentJournalInstance()
+    if not instanceID then
         return nil, "the client would not say which instance this is"
     end
 
@@ -887,8 +859,8 @@ local function FindEncounter(dungeonEncounterID)
 end
 
 -- Called at the pull. Everything is guarded and nothing here is required to
--- succeed: a journal that cannot be read costs the two doors that already
--- work exactly nothing.
+-- succeed: a journal that cannot be read costs the aura door exactly
+-- nothing.
 local function LearnEncounter(dungeonEncounterID)
     if not (db and db.djRecord and db.djFromJournal) then return end
     if type(dungeonEncounterID) ~= "number" then return end
@@ -908,6 +880,164 @@ local function LearnEncounter(dungeonEncounterID)
 end
 
 --------------------------------------------------------------------------------
+-- The catalog: every boss ability of the current expansion, ahead of time
+--
+-- The pull-time door above learns one boss at the moment it is pulled. This
+-- walks the same section trees for every dungeon and raid of the current
+-- expansion, on request, so the whole list can be marked before you set foot
+-- in any of them.
+--
+-- KEPT APART FROM THE JOURNAL
+--
+-- An expansion is several hundred to a thousand spell ids, and the journal
+-- holds four hundred and evicts never-seen records first -- a pre-fill written
+-- into it would evict itself. So it lives in djCatalog, counts against nothing,
+-- and is replaced wholesale on every rebuild. The window shows the two
+-- together; marking a catalog entry writes it into the journal (SetDebuffMark),
+-- where a marked record is never evicted.
+--
+-- IT HAS TO MOVE THE PLAYER'S DUNGEON JOURNAL, SO IT PUTS IT BACK
+--
+-- EJ_GetInstanceByIndex only lists the *selected* tier, and there is no way to
+-- enumerate one without EJ_SelectTier -- which the Adventure Guide persists as
+-- the player's own choice. So the selected tier is saved and restored, the way
+-- RCLootCouncil does it, and the whole walk runs inside a single call: no frame
+-- is ever drawn with the selection moved. The selected *instance* has no
+-- getter at all, so the walk refuses while the Adventure Guide is open -- its
+-- boss list reads whatever instance is selected -- and otherwise restores the
+-- one it remembers, when its window has been loaded.
+--
+-- Difficulty is never touched. Sections are flagged by difficulty rather than
+-- removed, so collecting every one gives the Mythic superset without calling
+-- EJ_SetDifficulty -- which changes what the player sees in the Adventure
+-- Guide, and which DBM notes has crashed the client with a bad index.
+--------------------------------------------------------------------------------
+
+local MAX_INSTANCES  = 30   -- per list; an expansion has around a dozen
+local MAX_ENCOUNTERS = 20   -- per instance; a raid has around ten
+
+-- The Adventure Guide, if it has been loaded, and whether it is on screen.
+-- Its IsShown is a getter on a client-owned frame, so it is asked through a
+-- pcall rather than trusted not to throw.
+local function AdventureGuideOpen()
+    local ej = rawget(_G, "EncounterJournal")
+    if not ej or not ej.IsShown then return false end
+    local ok, shown = pcall(ej.IsShown, ej)
+    return ok and shown == true
+end
+
+-- The tier the game considers current: expansion level is 0-based, tiers are
+-- 1-based and in expansion order -- the same arithmetic Blizzard's own journal
+-- uses. Clamped, because a tier past the end is a question with no answer.
+local function CurrentExpansionTier()
+    local n = EJ_GetNumTiers()
+    if type(n) ~= "number" or n < 1 then return nil end
+    local level = GetServerExpansionLevel and GetServerExpansionLevel()
+    local tier = (type(level) == "number") and (level + 1) or n
+    if tier > n then tier = n end
+    if tier < 1 then tier = 1 end
+    return tier
+end
+
+-- Every dungeon and raid of the selected tier. The raid list opens with an
+-- "instance" that is really the tier's world bosses, which has no dungeon map;
+-- it is skipped by that, the way MRT skips it.
+local function ListInstances()
+    local out = {}
+    for _, isRaid in ipairs({ false, true }) do
+        for i = 1, MAX_INSTANCES do
+            local id, name, _, _, _, _, _, areaMapID = EJ_GetInstanceByIndex(i, isRaid)
+            if not id then break end
+            if areaMapID ~= 0 then
+                out[#out + 1] = { id = id, name = name, raid = isRaid }
+            end
+        end
+    end
+    return out
+end
+
+-- The walk proper, run under pcall by PrefillDebuffs so the journal's
+-- selection is restored whatever happens in here.
+local function BuildCatalog(tier, entries)
+    EJ_SelectTier(tier)
+    local tierName = EJ_GetTierInfo and EJ_GetTierInfo(tier) or nil
+
+    local instances = ListInstances()
+    for _, inst in ipairs(instances) do
+        -- Selected first even though the id is passed explicitly: the explicit
+        -- form is documented to need a selection made at least once this
+        -- session, and every shipping caller selects before it asks.
+        EJ_SelectInstance(inst.id)
+        for e = 1, MAX_ENCOUNTERS do
+            local name, _, _, rootSectionID = EJ_GetEncounterInfoByIndex(e, inst.id)
+            if not name then break end
+            WalkSections(rootSectionID, function(spellID, title, icon, sectionID)
+                -- Debuffs only -- see DebuffTags.
+                local tags = DebuffTags(sectionID)
+                if not tags then return end
+                -- First writer wins: an ability two bosses share is filed
+                -- under the first one listed, not moved about by the walk.
+                if not entries[spellID] then
+                    local c = { name = title, icon = icon, encounter = name,
+                                instance = inst.name, raid = inst.raid }
+                    ApplyTags(c, tags)
+                    entries[spellID] = c
+                end
+            end)
+        end
+    end
+
+    return tierName, #instances
+end
+
+-- Returns the number of boss abilities catalogued, or nil and a reason. A
+-- failed or empty walk leaves the previous catalog exactly as it was.
+function ns.PrefillDebuffs()
+    if not catalog then return nil, "the debuff journal is not loaded" end
+    if not (EJ_GetNumTiers and EJ_SelectTier and EJ_GetCurrentTier
+            and EJ_GetInstanceByIndex and EJ_SelectInstance
+            and EJ_GetEncounterInfoByIndex) then
+        return nil, "this client has no Encounter Journal API"
+    end
+    if InCombatLockdown and InCombatLockdown() then
+        return nil, "not in combat -- try again once the fight is over"
+    end
+    if AdventureGuideOpen() then
+        return nil, "close the Adventure Guide first -- pre-filling has to "
+                    .. "borrow its selection for a moment"
+    end
+
+    local tier = CurrentExpansionTier()
+    if not tier then return nil, "the Encounter Journal lists no tiers" end
+
+    local prevTier = EJ_GetCurrentTier()
+    local ej = rawget(_G, "EncounterJournal")
+    local prevInstance = ej and ej.instanceID
+
+    local entries = {}
+    local ok, tierName, instances = pcall(BuildCatalog, tier, entries)
+
+    if type(prevTier) == "number" and prevTier > 0 then pcall(EJ_SelectTier, prevTier) end
+    if type(prevInstance) == "number" then pcall(EJ_SelectInstance, prevInstance) end
+
+    if not ok then return nil, "the walk failed: " .. tostring(tierName) end
+
+    local n = 0
+    for _ in pairs(entries) do n = n + 1 end
+    if n == 0 then
+        return nil, format("the Encounter Journal listed no boss abilities for %s",
+                           tierName or ("tier " .. tier))
+    end
+
+    catalog.entries   = entries
+    catalog.tier      = tierName
+    catalog.instances = instances
+    catalog.built     = Now()
+    dirty = true
+    return n
+end
+
+--------------------------------------------------------------------------------
 -- Module lifecycle
 --------------------------------------------------------------------------------
 
@@ -918,6 +1048,8 @@ function M:OnInit()
     -- that starts empty.
     if type(db.djSeen) ~= "table" then db.djSeen = {} end
     seen = db.djSeen
+    if type(db.djCatalog) ~= "table" then db.djCatalog = {} end
+    catalog = db.djCatalog
 
     -- The added-aura list is the rich door, and the one that arrives without
     -- being asked for. An update carrying no list -- an older client, or a
@@ -937,31 +1069,9 @@ function M:OnInit()
         FullScan()
     end)
 
-    -- Probed, not assumed -- but asked once per patch, not once per login.
-    --
-    -- On a client that protects the combat log this call is refused, and until
-    -- it was guarded the refusal unwound the rest of this function: no zone-in
-    -- scan, no ticker, no redraw, and a journal that looked broken rather than
-    -- merely poorer. Guarding it stopped the damage but not the noise -- the
-    -- client fires ADDON_ACTION_FORBIDDEN whether or not the error is caught,
-    -- so an addon that simply retries every login hands the player an error
-    -- report every login about a door it already knows is shut.
-    --
-    -- So the refusal is dated with the interface version and believed until
-    -- that changes, which is the soonest Blizzard's answer could change.
-    -- /tt debuffs log asks again now, for the case it was situational.
-    local build = ClientBuild()
-    if not db.djFromLog then
-        -- Switched off, so nothing is asked. Not the same as a refusal, and
-        -- worth having as its own branch: it is the one setting that
-        -- guarantees this addon gives the client nothing to complain about.
-        logAllowed = false
-    elseif db.djLogRefusedOn == build then
-        logAllowed, logRemembered = false, true
-    else
-        logAllowed = ns.RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED", OnCombatLog)
-        db.djLogRefusedOn = (not logAllowed) and build or nil
-    end
+    -- Settings from the combat log door, which is gone. Cleared rather than
+    -- left to ride along in the saved variables forever.
+    db.djFromLog, db.djLogRefusedOn = nil, nil
 
     -- Catches what is already on you: a debuff applied while the addon was
     -- loading, or across a zone in, never produces an added-aura event we see.
@@ -972,8 +1082,6 @@ function M:OnInit()
     -- ordering is the .toc's job and the reason it is written down.
     ns.RegisterEvents({ "PLAYER_ENTERING_WORLD", "PLAYER_LOGIN",
                         "GROUP_ROSTER_UPDATE" }, function()
-        myGUID = UnitGUID and Clean(UnitGUID("player")) or nil
-        RebuildTankGUIDs()
         if db.djRecord then FullScan() end
     end)
 
@@ -1007,17 +1115,8 @@ ns.RegisterStatusProvider(40, function(yn)
     local s = ns.DebuffStats()
     Print(format("debuff journal: recording=%s  recorded=%d/%d",
                  yn(s.recording), s.total, s.cap))
-    Print(format("  aura reads here=%s  combat log=%s",
-                 s.restricted and "|cffff8000refused|r" or "|cff00ff00allowed|r",
-                 (not s.fromLog) and "|cff808080off|r -- nothing is asked of "
-                         .. "the client"
-                     or s.logRemembered
-                     and "|cffff4040refused before on this build|r "
-                         .. "-- |cffffff00/tt debuffs log|r asks again"
-                     or (not s.logAllowed)
-                     and "|cffff4040the client refuses to register for it|r"
-                     or (s.logOpen and "|cff00ff00on|r"
-                         or "|cffff4040cannot tell our own lines apart|r")))
+    Print(format("  aura reads here=%s",
+                 s.restricted and "|cffff8000refused|r" or "|cff00ff00allowed|r"))
 
     -- The line that answers "the panel drew them, so why is the list empty".
     -- Printed only when it has actually happened, because zero is the normal
@@ -1041,15 +1140,11 @@ ns.RegisterStatusProvider(40, function(yn)
                      or format("|cff00ff00on|r -- %d spell(s) learned from "
                                .. "boss ability lists", s.journalIDs)))
 
-    -- Co-tanks are half of what this records, and the half that goes quiet
-    -- without anything looking wrong. Printed only in a group, because "0
-    -- co-tanks" solo is not news.
-    if s.tanksKnown > 0 or s.tanksBlind > 0 then
-        Print(format("  co-tanks recognised=%d%s", s.tanksKnown,
-                     s.tanksBlind > 0
-                         and format("  |cffff8000%d the client will not name|r"
-                                    .. " -- their debuffs cannot be recorded"
-                                    .. " from the log here", s.tanksBlind)
-                         or ""))
-    end
+    Print(format("  pre-filled catalog=%s", s.catalog > 0
+                     and format("%d boss abilities from %d instance(s)%s",
+                                s.catalog, s.catalogInstances,
+                                s.catalogTier and (" of " .. s.catalogTier) or "")
+                     or "|cff808080empty|r -- |cffffff00/tt debuffs prefill|r"
+                        .. " builds it"))
+
 end, "debuffs")

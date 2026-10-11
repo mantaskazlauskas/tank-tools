@@ -31,7 +31,9 @@ WORLD.units["player"] = {
 -- read -- exactly the window a saved flag is read in.
 TankToolsDB = {
     dbVersion = 2,
-    modules = { features = { debuffs = true } },
+    -- The two settings the removed combat log door left behind.
+    modules = { features = { debuffs = true },
+                debuffs = { djFromLog = true, djLogRefusedOn = 120000 } },
 }
 
 -- What the game's data files know. Not a unit read, so it answers in an
@@ -88,6 +90,9 @@ eq(NS.FeatureEnabled("debuffs"), true, "which this suite turned on")
 ok(NS.GetTicker("debuffs") ~= nil, "so its module started")
 eq(TankToolsDB.modules.debuffs.djRecord, true, "recording is on out of the box")
 ok(type(TankToolsDB.modules.debuffs.djSeen) == "table", "and the journal exists")
+eq(TankToolsDB.modules.debuffs.djFromLog, nil,
+   "the removed combat log door's setting is cleared from the saved variables")
+eq(TankToolsDB.modules.debuffs.djLogRefusedOn, nil, "and so is its remembered refusal")
 
 --------------------------------------------------------------------------------
 section("recording -- the aura door")
@@ -177,53 +182,23 @@ eq(r.dispel, "Magic", "and so does the dispel type")
 eq(r.n,      2,       "the sighting is still counted")
 
 --------------------------------------------------------------------------------
-section("recording -- the combat log")
+section("the spell database fills in what the aura did not say")
 --------------------------------------------------------------------------------
 
-FireCombatLog("SPELL_AURA_APPLIED", 300001, "Log Only", "DEBUFF")
-
-r = Find(300001)
-ok(r ~= nil, "a debuff seen only in the combat log is still recorded")
-if r then
-    eq(r.via,    "log",      "and says so")
-    eq(r.name,   "Log Only", "the log carries a name")
-    eq(r.dispel, nil,        "but no dispel type")
-    eq(r.raid,   nil,        "and no raid flag")
-    eq(r.boss,   nil,        "and no boss flag")
-end
-
--- The half of a log-only record the spell database can fill in. The log gives
--- an id and nothing else useful; asking what that id is called is not a
--- question about a unit, so it is answerable here.
-FireCombatLog("SPELL_AURA_APPLIED", 300002, nil, "DEBUFF")
+Added({ spellId = 300002, isHarmful = true })
 r = Find(300002)
-eq(r and r.name, "Catalogued", "the spell database names a record the log did not")
-eq(r and r.icon, 222,          "and gives it an icon, which no log line carries")
-
-FireCombatLog("SPELL_AURA_APPLIED", 300003, "A Buff", "BUFF")
-ok(Find(300003) == nil, "a buff in the log is not a debuff")
-
-FireCombatLog("SPELL_AURA_APPLIED", 300004, "Not Mine", "DEBUFF",
-              "Player-1-SOMEBODYELSE")
-ok(Find(300004) == nil, "a debuff applied to somebody else is not ours")
-
-FireCombatLog("SPELL_DAMAGE", 300005, "A Hit", "DEBUFF")
-ok(Find(300005) == nil, "a damage line is not an aura application")
+eq(r and r.name, "Catalogued", "the spell database names a record the aura did not")
+eq(r and r.icon, 222,          "and gives it an icon")
 
 --------------------------------------------------------------------------------
-section("the doors are ranked")
+section("the combat log is not read")
 --------------------------------------------------------------------------------
 
-FireCombatLog("SPELL_AURA_APPLIED", 400001, "Upgraded", "DEBUFF")
-eq(Find(400001).via, "log", "a debuff first met in the log is a log record")
-
-Added(Aura(400001, { name = "Upgraded", dispel = "Curse", boss = true }))
-r = Find(400001)
-eq(r.via,    "aura",  "and is upgraded the first time the aura door opens")
-eq(r.dispel, "Curse", "gaining the flags a log line could never have carried")
-
-FireCombatLog("SPELL_AURA_REFRESH", 400001, "Upgraded", "DEBUFF")
-eq(Find(400001).via, "aura", "and never falls back to the poorer door")
+-- Removed on purpose: a client that protects COMBAT_LOG_EVENT_UNFILTERED
+-- refuses the registration and shows the player an error for asking, at
+-- startup. The journal must not ask at all.
+eq(EVENT_ATTEMPTS.COMBAT_LOG_EVENT_UNFILTERED, nil,
+   "the journal never registers for the combat log")
 
 --------------------------------------------------------------------------------
 section("reading our own auras")
@@ -257,16 +232,11 @@ local store = TankToolsDB.modules.debuffs
 
 store.djRecord = false
 Added(Aura(600001, { name = "Not Wanted" }))
-FireCombatLog("SPELL_AURA_APPLIED", 600002, "Also Not Wanted", "DEBUFF")
-ok(Find(600001) == nil and Find(600002) == nil, "neither door records while off")
+ok(Find(600001) == nil, "nothing is recorded while off")
 
 store.djRecord = true
-store.djFromLog = false
-FireCombatLog("SPELL_AURA_APPLIED", 600003, "Log Off", "DEBUFF")
-ok(Find(600003) == nil, "the log door closes on its own")
 Added(Aura(600004, { name = "Aura Still On" }))
-ok(Find(600004) ~= nil, "without shutting the other one")
-store.djFromLog = true
+ok(Find(600004) ~= nil, "and recording resumes when it is back on")
 
 --------------------------------------------------------------------------------
 section("reading it back")
@@ -289,7 +259,7 @@ end
 ok(sorted, "and by name when asked, ascending")
 
 eq(#NS.DebuffRecords("gushing"), 1, "the filter matches a name, case-insensitively")
-eq(#NS.DebuffRecords("300001"),  1, "and matches a spell id")
+eq(#NS.DebuffRecords("300002"),  1, "and matches a spell id")
 eq(#NS.DebuffRecords("  gushing  "), 1, "and does not care about stray spaces")
 eq(#NS.DebuffRecords("no such debuff"), 0, "and matches nothing when nothing does")
 
@@ -297,7 +267,6 @@ local stats = NS.DebuffStats()
 ok(stats.total > 0, "the stats count the journal")
 eq(stats.recording, true, "and report that recording is on")
 eq(stats.restricted, SECRET_AURAS, "and whether aura reads are allowed here")
-eq(stats.logOpen, true, "and that we can pick our own lines out of the log")
 
 -- The list handed out is a fresh array, so a caller cannot edit the journal by
 -- holding on to it -- and an eviction cannot happen underneath a redraw that
@@ -307,35 +276,6 @@ local size = #copy
 table.remove(copy)
 ok(copy ~= NS.DebuffRecords(), "each call hands back a different array")
 eq(#NS.DebuffRecords(), size, "and editing one does not shorten the journal")
-
---------------------------------------------------------------------------------
-section("our own lines survive a secret GUID")
---------------------------------------------------------------------------------
-
--- This is the regression that made the journal thinnest in exactly the content
--- worth cataloguing. Inside an instance UnitGUID("player") is a secret, so the
--- GUID compare could never match and the log door shut itself in the one place
--- the aura door was already shut -- both doors closed at once, and the feature
--- looked broken rather than restricted.
---
--- destFlags is the way out: an affiliation bitmask on the log line, needing
--- nobody's identity, so a line aimed at us is recognisably ours in a raid.
-WORLD.guidSecret = true
-FireEvent("PLAYER_ENTERING_WORLD")
-
-FireCombatLog("SPELL_AURA_APPLIED", 650001, "Ours Anyway", "DEBUFF")
-ok(Find(650001) ~= nil, "a line flagged MINE is recorded without a readable GUID")
-eq(NS.DebuffStats().logOpen, true, "and the journal reports the door open")
-eq(NS.DebuffStats().selfByFlag, true, "attributed by the affiliation mask")
-
--- Both routes gone at once: no GUID to compare, and a mask the client will not
--- let us read either. Nothing is recorded, and nothing throws.
-FireCombatLog("SPELL_AURA_APPLIED", 650002, "Unattributable", "DEBUFF",
-              nil, SECRETV)
-ok(Find(650002) == nil, "nothing is recorded when neither route can attribute it")
-
-WORLD.guidSecret = false
-FireEvent("PLAYER_ENTERING_WORLD")
 
 --------------------------------------------------------------------------------
 section("co-tank debuffs")
@@ -354,22 +294,10 @@ WORLD.units["raid3"] = { name = "Healbot",  guid = "Player-3-HEALBOT",
 FireEvent("GROUP_ROSTER_UPDATE")
 
 ok(#NS.tankUnits >= 2, "the roster produced co-tanks")
-eq(NS.DebuffStats().tanksBlind, 0, "whose GUIDs are readable out here")
-
-FireCombatLog("SPELL_AURA_APPLIED", 660001, "Tank Smash", "DEBUFF",
-              "Player-2-BEARBUTT")
-ok(Find(660001) ~= nil, "a co-tank's debuff is recorded from the log")
-
--- The scope is tanks, and a scope that quietly took everybody would fill the
--- journal with other people's problems.
-FireCombatLog("SPELL_AURA_APPLIED", 660002, "Healer Problem", "DEBUFF",
-              "Player-3-HEALBOT")
-ok(Find(660002) == nil, "a healer's is not")
 
 if not SECRET_AURAS then
-    -- The rich door, pointed at somebody else. SCAN_GAP has to pass first: the
-    -- zone-in above already scanned, and a second walk inside the same second
-    -- is the throttle doing its job.
+    -- SCAN_GAP has to pass first: the roster update above already scanned,
+    -- and a second walk inside the same second is the throttle doing its job.
     WORLD.units["raid2"].auras = { Aura(660003, { name = "On The Other Tank",
                                                   boss = true }) }
     Tick(1.5)
@@ -377,30 +305,15 @@ if not SECRET_AURAS then
     local r = Find(660003)
     ok(r ~= nil, "a co-tank's aura is read where the client allows it")
     if r then eq(r.via, "aura", "and recorded through the rich door") end
+
+    -- The scope is tanks, and a scope that quietly took everybody would fill
+    -- the journal with other people's problems.
+    WORLD.units["raid3"].auras = { Aura(660002, { name = "Healer Problem" }) }
+    Tick(1.5)
+    FireEvent("UNIT_AURA", "raid3")
+    ok(Find(660002) == nil, "a healer's is not")
 end
 
--- WHAT THIS CANNOT DO, STATED RATHER THAN HIDDEN
---
--- Attributing a log line to a co-tank *specifically* needs a GUID, and an
--- encounter takes GUIDs away. destFlags cannot stand in: its affiliation bits
--- distinguish mine / party / raid and have no notion of role, so "this line is
--- about a tank" is exactly the question the mask cannot answer.
---
--- So co-tank recording degrades to nothing inside an encounter, and the status
--- command says so. That is the honest shape of it -- the alternative is a
--- journal that silently stops learning about the other tank on the one night
--- it matters.
-WORLD.guidSecret = true
-FireEvent("GROUP_ROSTER_UPDATE")
-
-eq(NS.DebuffStats().tanksKnown, 0, "no co-tank can be recognised")
-ok(NS.DebuffStats().tanksBlind > 0, "and the journal counts how many it lost")
-
-FireCombatLog("SPELL_AURA_APPLIED", 660004, "Unattributable Tank Hit", "DEBUFF",
-              "Player-2-BEARBUTT")
-ok(Find(660004) == nil, "a co-tank's line cannot be attributed in an encounter")
-
-WORLD.guidSecret = false
 WORLD.inRaid, WORLD.groupSize = false, 0
 WORLD.units["raid1"], WORLD.units["raid2"], WORLD.units["raid3"] = nil, nil, nil
 FireEvent("GROUP_ROSTER_UPDATE")
@@ -413,23 +326,33 @@ section("the third door -- the Encounter Journal")
 -- can answer before anybody has been hit. It is content data, so it works
 -- identically in both scenarios -- that is the whole point of it, and asserting
 -- it under `secret` is asserting exactly that.
+-- Found the way the client allows: the game map id GetInstanceInfo reports,
+-- mapped to the journal's instance id.
+WORLD.instanceMapID = 2300
 WORLD.journal = {
     instance   = 1200,
+    mapID      = 2300,
     encounters = {
         { name = "Trash Boss", journalID = 2001, dungeonID = 3001, root = 10 },
         { name = "The Boss",   journalID = 2002, dungeonID = 3002, root = 20 },
     },
     sections = {
         -- The other boss, which must not be walked.
-        [10] = { title = "Wrong Boss Ability", spellID = 710001 },
+        [10] = { title = "Wrong Boss Ability", spellID = 710001, icons = { 0 } },
         -- A heading with no spell of its own, holding two abilities.
         [20] = { title = "Abilities", firstChildSectionID = 21 },
+        -- Icon indices as the client returns them: 0 is the Tank alert,
+        -- 7 Magic, 13 Bleed, 6 Interruptible.
         [21] = { title = "Tank Buster", spellID = 700001, abilityIcon = 77,
-                 siblingSectionID = 22 },
-        [22] = { title = "Raid Wide",   spellID = 700002, siblingSectionID = 23 },
+                 siblingSectionID = 22, icons = { 0 } },
+        [22] = { title = "Raid Wide",   spellID = 700002, siblingSectionID = 25,
+                 icons = { 7 } },
+        -- A cast, not a debuff: interruptible and nothing else.
+        [25] = { title = "Summon Adds", spellID = 700009, siblingSectionID = 23,
+                 icons = { 6 } },
         -- A child of a sibling: the walk has to go down as well as across.
         [23] = { title = "Phase Two", firstChildSectionID = 24 },
-        [24] = { title = "Enrage", spellID = 700003 },
+        [24] = { title = "Lacerate", spellID = 700003, icons = { 13 } },
     },
 }
 
@@ -439,6 +362,10 @@ ok(Find(700001) ~= nil, "a boss ability is learned before it ever lands")
 ok(Find(700002) ~= nil, "...including one on a sibling section")
 ok(Find(700003) ~= nil, "...and one nested under a sibling")
 ok(Find(710001) == nil, "another boss's abilities are not swept in")
+ok(Find(700009) == nil, "an ability the journal does not tag as a debuff is left out")
+eq(Find(700001).tank, true, "the Tank alert is kept as the tank flag")
+eq(Find(700002).dispel, "Magic", "a dispel icon becomes the dispel type")
+eq(Find(700003).bleed, true, "and Bleed is kept")
 
 local jr = Find(700001)
 eq(jr.via,  "journal", "and it is marked as coming from the journal")
@@ -472,7 +399,14 @@ FireEvent("ENCOUNTER_START", 3001, "Trash Boss", 16, 20)
 ok(Find(710001) ~= nil, "it falls back to selecting when the client requires it")
 eq(EJ_SELECTED, 1200, "and says which instance it selected")
 
-WORLD.journal, EJ_SELECTED = nil, nil
+-- And the client this door has to work on: GetInstanceInfo naming a map the
+-- journal does not know is a reported miss, not a silent one.
+WORLD.journal.needsSelect = nil
+WORLD.instanceMapID = 9999
+FireEvent("ENCOUNTER_START", 3003, "Elsewhere", 16, 20)
+ok(NS.DebuffStats().journalErr ~= nil, "an instance the journal cannot map is reported")
+
+WORLD.journal, EJ_SELECTED, WORLD.instanceMapID = nil, nil, nil
 
 --------------------------------------------------------------------------------
 section("the window")
@@ -490,8 +424,6 @@ local texts = TextsIn(panel)
 ok(TextMatching(texts, "Gushing Wound") ~= nil, "it lists a debuff by name")
 ok(TextMatching(texts, "#100001") ~= nil,       "and by spell id")
 ok(TextMatching(texts, "Magic") ~= nil,         "and shows the dispel type")
-ok(TextMatching(texts, "log only") ~= nil,
-   "and marks the records that only ever came through the log")
 ok(TextMatching(texts, "recorded of") ~= nil,   "and says how full the journal is")
 
 -- Typing in the filter box narrows the list as you go, without a keypress to
@@ -531,7 +463,8 @@ ok(not GameTooltip:IsShown(), "and takes it away again")
 
 -- A spell the client has never heard of: SetSpellByID errors rather than
 -- returning nothing, and the row has to survive that with a tooltip of its own.
-panel.filter:SetText("Log Only")
+Added(Aura(300009, { name = "Not In The Database" }))
+panel.filter:SetText("Not In The Database")
 panel.filter._scripts.OnTextChanged(panel.filter)
 
 rowFrames[1]._scripts.OnEnter(rowFrames[1])
@@ -549,7 +482,7 @@ section("scrolling")
 
 for i = 1, 20 do
     WALL = WALL + 1
-    FireCombatLog("SPELL_AURA_APPLIED", 800000 + i, "Filler " .. i, "DEBUFF")
+    Added(Aura(800000 + i, { name = "Filler " .. i }))
 end
 
 -- A record changing only marks the journal dirty; the redraw is on the shared
@@ -579,7 +512,7 @@ section("the cap")
 
 for i = 1, 420 do
     WALL = WALL + 1
-    FireCombatLog("SPELL_AURA_APPLIED", 1000000 + i, "Bulk " .. i, "DEBUFF")
+    Added(Aura(1000000 + i, { name = "Bulk " .. i }))
 end
 
 eq(#NS.DebuffRecords(), 400, "the journal is capped, and the oldest go first")
@@ -598,7 +531,7 @@ Tick(1)
 ok(panel.empty:IsShown(), "the open window says so rather than showing stale rows")
 ok(not rowFrames[1]:IsShown(), "with every row hidden")
 
-FireCombatLog("SPELL_AURA_APPLIED", 111111, "After The Wipe", "DEBUFF")
+Added(Aura(111111, { name = "After The Wipe" }))
 ok(Find(111111) ~= nil, "and recording carries straight on")
 
 --------------------------------------------------------------------------------
@@ -637,7 +570,7 @@ section("marking")
 
 -- The last command cleared the journal, so this is a fresh record for a mark
 -- to land on.
-FireCombatLog("SPELL_AURA_APPLIED", 700001, "Trash Nuisance", "DEBUFF")
+Added(Aura(700001, { name = "Trash Nuisance" }))
 
 local important, ignored = NS.DebuffMarkedIDs()
 eq(important[700001], nil, "unmarked to start")
@@ -670,14 +603,14 @@ eq(NS.DebuffMarkCounts(), 0,
 section("marks and pruning")
 --------------------------------------------------------------------------------
 
-FireCombatLog("SPELL_AURA_APPLIED", 700002, "Kept Forever", "DEBUFF")
+Added(Aura(700002, { name = "Kept Forever" }))
 NS.SetDebuffMark(700002, "important")
 
 -- Four hundred fresh records, all newer than the marked one, is well past
 -- what it would take to prune an ordinary record on recency alone.
 for i = 1, 400 do
     WALL = WALL + 1
-    FireCombatLog("SPELL_AURA_APPLIED", 710000 + i, "Padding " .. i, "DEBUFF")
+    Added(Aura(710000 + i, { name = "Padding " .. i }))
 end
 
 ok(Find(700002) ~= nil,
@@ -699,7 +632,7 @@ eq(#NS.DebuffRecords(), 0, "clearing the mark lets the last one go too")
 section("marking from the row")
 --------------------------------------------------------------------------------
 
-FireCombatLog("SPELL_AURA_APPLIED", 700003, "Click Me", "DEBUFF")
+Added(Aura(700003, { name = "Click Me" }))
 Tick(1)   -- the window is still open; flush the redraw
 
 panel.filter:SetText("Click Me")
@@ -753,8 +686,185 @@ WORLD.forbiddenEvents = nil
 eq(NS.RegisterEvent("TT_TEST_PROTECTED", function() end), true,
    "and a later attempt is not poisoned by the earlier refusal")
 
-eq(NS.DebuffStats().logAllowed, true,
-   "the journal reports the combat log door it actually got")
+
+--------------------------------------------------------------------------------
+section("pre-filling a whole expansion from the Encounter Journal")
+--------------------------------------------------------------------------------
+
+-- Two tiers: an old expansion the player happens to be browsing, and the
+-- current one. The walk has to pick the current one, borrow the selection to
+-- read it, and hand the player's back.
+WORLD.expansionLevel = 1          -- 0-based, so tier 2 is current
+WORLD.ejTier = 1                  -- what the player last looked at
+WORLD.ejSections = {
+    [900] = { title = "Old Ability", spellID = 800900, icons = { 0 } },
+    [910] = { title = "Cleave", spellID = 800001, abilityIcon = 55,
+              siblingSectionID = 911, icons = { 0 } },
+    [911] = { title = "Poison Pool", spellID = 800002, siblingSectionID = 912,
+              icons = { 9 } },
+    -- Tagged, but only as deadly and interruptible: not a debuff.
+    [912] = { title = "Big Cast", spellID = 800005, icons = { 4, 6 } },
+    [920] = { title = "Stage One", firstChildSectionID = 921 },
+    [921] = { title = "Crushing Blow", spellID = 800003, icons = { 0, 13 } },
+    -- Shared with the first boss: filed under whoever is listed first.
+    [930] = { title = "Cleave Again", spellID = 800001, icons = { 0 } },
+    [940] = { title = "World Boss Stomp", spellID = 800099, icons = { 0 } },
+    [950] = { title = "Raid Tank Buster", spellID = 800010, icons = { 0 } },
+    -- No icons at all.
+    [951] = { title = "Raid Adds", spellID = 800011 },
+}
+WORLD.ejTiers = {
+    { name = "Old Expansion",
+      dungeons = { { id = 50, name = "Old Keep", encounters = {
+                       { name = "Old Boss", root = 900 } } } } },
+    { name = "Current Expansion",
+      dungeons = {
+          { id = 60, name = "Spider Den", encounters = {
+                { name = "Broodmother", root = 910 },
+                { name = "Second Boss", root = 930 } } },
+          { id = 61, name = "Stone Vault", encounters = {
+                { name = "Golem", root = 920 } } },
+      },
+      raids = {
+          -- The tier's world bosses, listed as an instance with no dungeon map.
+          { id = 70, name = "World Bosses", areaMap = 0, encounters = {
+                { name = "Big Stomper", root = 940 } } },
+          { id = 71, name = "The Big Raid", encounters = {
+                { name = "Raid Boss", root = 950 },
+                { name = "Adds Boss", root = 951 } } },
+      } },
+}
+
+local totalBefore = NS.DebuffStats().total
+EncounterJournal = { instanceID = 555, IsShown = function() return false end }
+EJ_SELECTED = 555
+
+local n, err = NS.PrefillDebuffs()
+eq(err, nil, "the pre-fill reports no problem")
+eq(n, 4, "every distinct boss ability of the current expansion is catalogued")
+
+local st = NS.DebuffStats()
+eq(st.catalog, 4, "the catalog holds them")
+eq(st.catalogTier, "Current Expansion", "from the current expansion's tier")
+eq(st.catalogInstances, 3, "two dungeons and a raid -- the world bosses skipped")
+eq(st.total, totalBefore, "and none of them counts against the journal's cap")
+
+eq(WORLD.ejTier, 1, "the player's selected tier is put back")
+eq(EJ_SELECTED, 555, "and so is the instance their Adventure Guide was showing")
+
+ok(Find(800001) == nil, "catalog entries are not in the journal proper")
+local function FindAll(id, q)
+    for _, r in ipairs(NS.DebuffRecords(q, nil, true)) do
+        if r.id == id then return r end
+    end
+end
+local c = FindAll(800001)
+ok(c ~= nil, "but the window's view includes them")
+eq(c.n, 0, "never seen")
+eq(c.via, "journal", "shown as not seen yet")
+eq(c.encounter, "Broodmother", "filed under the first boss that lists it")
+eq(c.instance, "Spider Den", "and its instance")
+ok(FindAll(800900) == nil, "another expansion's abilities are not swept in")
+ok(FindAll(800099) == nil, "nor the world bosses")
+ok(FindAll(800010) ~= nil, "raid bosses are")
+ok(FindAll(800005) == nil, "a deadly, interruptible cast is not a debuff")
+ok(FindAll(800011) == nil, "nor is an ability with no tags at all")
+eq(FindAll(800002).dispel, "Poison", "the dispel tag is carried to the row")
+local cb = FindAll(800003)
+ok(cb.tank and cb.bleed, "and so are tank and bleed, together")
+ok(FindAll(800003, "stone vault") ~= nil, "filtering by instance name finds its abilities")
+ok(FindAll(800003, "golem") ~= nil, "and by boss name")
+
+-- Marking one writes it into the journal, where a mark is never evicted.
+NS.SetDebuffMark(800003, "important")
+local marked = Find(800003)
+ok(marked ~= nil and marked.mark == "important", "marking a catalog entry records it")
+eq(marked.encounter, "Golem", "carrying where it came from")
+ok(NS.DebuffMarkedIDs()[800003], "and the co-tank row will see the mark")
+
+-- A rebuild replaces the catalog and keeps the mark.
+eq(NS.PrefillDebuffs(), 4, "pre-filling again rebuilds rather than piling up")
+eq(Find(800003).mark, "important", "the mark survives the rebuild")
+
+-- Refusals leave the catalog as it was, and say why.
+WORLD.inCombat = true
+local none, why = NS.PrefillDebuffs()
+eq(none, nil, "no pre-fill in combat")
+ok(why and why:find("combat") ~= nil, "and it says so")
+WORLD.inCombat = false
+
+EncounterJournal.IsShown = function() return true end
+none, why = NS.PrefillDebuffs()
+eq(none, nil, "no pre-fill while the Adventure Guide is open")
+ok(why and why:find("Adventure Guide") ~= nil, "because it would repoint what is on screen")
+EncounterJournal = nil
+
+local emptyTier = WORLD.ejTiers[2]
+WORLD.ejTiers[2] = { name = "Empty" }
+none, why = NS.PrefillDebuffs()
+eq(none, nil, "an empty expansion is reported")
+eq(NS.DebuffStats().catalog, 4, "and the previous catalog is kept")
+WORLD.ejTiers[2] = emptyTier
+
+-- A client without the icon call cannot tell debuffs from casts. It keeps
+-- everything rather than nothing: an unfiltered list can be read, an empty
+-- one is a button that seems to do nothing.
+local iconCall = C_EncounterJournal.GetSectionIconFlags
+C_EncounterJournal.GetSectionIconFlags = nil
+eq(NS.PrefillDebuffs(), 6, "without icon tags every ability is kept")
+C_EncounterJournal.GetSectionIconFlags = iconCall
+NS.PrefillDebuffs()
+
+local nc = #CHAT
+Slash("debuffs prefill")
+ok(table.concat(ChatSince(nc), " "):find("pre-filled 4 boss abilities", 1, true) ~= nil,
+   "/tt debuffs prefill does the same and says what it found")
+
+NS.ShowDebuffs()
+ok(table.concat(TextsIn(_G.TankToolsDebuffsFrame), " "):find("pre-filled", 1, true) ~= nil,
+   "the window's footer counts the catalog")
+
+--------------------------------------------------------------------------------
+section("clearing everything, marks and catalog included")
+--------------------------------------------------------------------------------
+
+-- The state the section above left: a catalog, and a marked record.
+ok(NS.DebuffStats().catalog > 0, "there is a catalog to clear")
+ok(Find(800003) and Find(800003).mark == "important", "and a mark")
+
+-- "Forget everything recorded" keeps both on purpose.
+NS.ForgetDebuffs()
+ok(Find(800003) ~= nil, "forgetting the recorded ones keeps the marked record")
+ok(NS.DebuffStats().catalog > 0, "and the catalog")
+
+local function ButtonLabelled(parent, label)
+    for _, k in ipairs(FramesParentedTo(parent)) do
+        if rawget(k, "_text") and tostring(k._text):find(label, 1, true) then return k end
+    end
+end
+
+local djPanel = _G.TankToolsDebuffsFrame
+local clearAll = ButtonLabelled(djPanel, "Clear everything")
+ok(clearAll ~= nil, "the window has a clear-everything button")
+
+clearAll._scripts.OnClick()
+ok(Find(800003) ~= nil, "one click only arms it")
+clearAll._scripts.OnClick()
+eq(#NS.DebuffRecords(), 0, "the second click clears every record")
+eq(NS.DebuffStats().catalog, 0, "and the pre-filled catalog")
+local imp, ign = NS.DebuffMarkCounts()
+eq(imp + ign, 0, "and the marks")
+eq(#NS.DebuffRecords(nil, nil, true), 0, "leaving the window's list empty")
+
+-- The command does the same, and the list builds again afterwards.
+NS.PrefillDebuffs()
+NS.SetDebuffMark(800001, "ignored")
+Slash("debuffs clear all")
+eq(NS.DebuffStats().catalog, 0, "/tt debuffs clear all clears the catalog")
+eq(#NS.DebuffRecords(), 0, "and the records, marks included")
+eq(NS.PrefillDebuffs(), 4, "and pre-filling again starts from nothing")
+
+WORLD.ejTiers, WORLD.ejSections, WORLD.ejTier = nil, nil, nil
 
 --------------------------------------------------------------------------------
 section("nothing latched")

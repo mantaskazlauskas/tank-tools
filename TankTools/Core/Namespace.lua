@@ -125,15 +125,15 @@ function ns.RefreshDebuffs() end
 function ns.DebuffRecords() return {} end
 function ns.DebuffDescription(_) return nil end
 function ns.ForgetDebuffs() return 0 end
+function ns.ClearDebuffJournal() return 0, 0 end
 function ns.DebuffStats()
-    return { total = 0, cap = 0, recording = false, fromLog = false,
-             restricted = false, logAllowed = false, logRemembered = false,
-             logOpen = false, sawAura = false, sawLog = false }
+    return { total = 0, cap = 0, recording = false, restricted = false,
+             sawAura = false, catalog = 0, catalogInstances = 0 }
 end
 function ns.SetDebuffMark(_, _) end
-function ns.RetryDebuffLog() return false end
 function ns.DebuffMarkedIDs() return {}, {} end
 function ns.DebuffMarkCounts() return 0, 0 end
+function ns.PrefillDebuffs() return nil, "the debuff journal is not loaded" end
 
 -- UI/Options.lua
 function ns.ToggleOptions() end

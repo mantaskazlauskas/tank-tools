@@ -18,10 +18,11 @@
 --
 -- WHAT A ROW MAY SAY IT DOES NOT KNOW
 --
--- Half the point of the journal is that its facts come through two doors of
--- very different quality -- see the header of Modules/Debuffs.lua -- so a row
+-- Half the point of the journal is that its facts come from sources of very
+-- different quality -- see the header of Modules/Debuffs.lua -- so a row
 -- distinguishes three states per flag, not two: yes, no, and "we never got to
--- look". A debuff caught only in the combat log has an id, a name and an icon
+-- look". A debuff caught only in the combat log (older records -- that door is
+-- gone) or learned from the Encounter Journal has an id, a name and an icon
 -- and no flags at all, and it says so rather than drawing five empty boxes
 -- that read as five noes.
 --
@@ -70,12 +71,19 @@ local Redraw
 -- remembering why. It is shaped like a settings store because ui.Segmented
 -- takes any table -- which is the point of the widget kit taking the table as
 -- an argument rather than reaching for ns.db.
-local view  = { sort = "recent" }
+--
+-- `catalog` shows the pre-filled boss abilities alongside what was recorded.
+-- On by default: pre-filling is something you asked for, and a button whose
+-- result is then hidden would read as a button that did nothing.
+local view  = { sort = "recent", catalog = true }
 local query = ""
 
 -- Arms the wipe. Reset whenever the window closes, so a click left armed
 -- yesterday cannot become a wipe you did not mean today.
 local armed = false
+-- The same, for the button that also takes the marks and the catalog. Its own
+-- flag, so arming one can never make a single click on the other destructive.
+local armedAll = false
 
 --------------------------------------------------------------------------------
 -- Words for the flags
@@ -118,6 +126,7 @@ local function MetaLine(r)
     if r.raid then parts[#parts + 1] = Chip("raid", "ffff9a3c") end
     if r.boss then parts[#parts + 1] = Chip("boss", "ffff5555") end
     if r.tank then parts[#parts + 1] = Chip("tank", GOLD) end
+    if r.bleed then parts[#parts + 1] = Chip("bleed", "ffc41e3a") end
     if r.mine then parts[#parts + 1] = Chip("yours", GREY) end
 
     -- Never read through the aura door, so every flag above is absent rather
@@ -199,11 +208,19 @@ local function ShowRowTooltip(row)
                                    r.tank and "yes" or "no"),
                             0.6, 0.6, 0.6)
     elseif r.via == "journal" then
-        GameTooltip:AddLine("listed as a boss ability in the Encounter Journal, "
-                            .. "which carries no flags", 0.6, 0.6, 0.6, true)
+        GameTooltip:AddLine("listed as a boss ability in the Encounter Journal "
+                            .. "and tagged there as a debuff -- its tags are "
+                            .. "shown above; the raid and boss flags only come "
+                            .. "from seeing it land", 0.6, 0.6, 0.6, true)
     else
         GameTooltip:AddLine("only ever seen in the combat log, which carries no "
                             .. "flags", 0.6, 0.6, 0.6, true)
+    end
+
+    if r.encounter or r.instance then
+        GameTooltip:AddLine(format("from %s%s%s", r.encounter or "",
+                                   (r.encounter and r.instance) and " -- " or "",
+                                   r.instance or ""), 0.6, 0.6, 0.6, true)
     end
 
     if r.n > 0 then
@@ -283,6 +300,9 @@ local function CreateRow(parent, i)
     r.when:SetJustifyH("RIGHT")
     r.when:SetPoint("RIGHT", -6, 6)
     r.when:SetWidth(110)
+    -- One line, truncated: an instance name is often wider than the column,
+    -- and a wrapped one would be drawn over the line below it.
+    r.when:SetWordWrap(false)
 
     r.count = r:CreateFontString(nil, "OVERLAY")
     r.count:SetFont(FONT, 11, "")
@@ -290,6 +310,7 @@ local function CreateRow(parent, i)
     r.count:SetJustifyH("RIGHT")
     r.count:SetPoint("RIGHT", -6, -7)
     r.count:SetWidth(110)
+    r.count:SetWordWrap(false)
 
     r:SetScript("OnEnter", function(self)
         self.hl:Show()
@@ -343,7 +364,7 @@ end
 function Redraw()
     if not panel then return end
 
-    records = ns.DebuffRecords(query, view.sort)
+    records = ns.DebuffRecords(query, view.sort, view.catalog)
 
     local maxOff = MaxOffset()
     if offset > maxOff then offset = maxOff end
@@ -362,8 +383,15 @@ function Redraw()
             row.icon:SetTexture(rec.icon or 134400)
             row.name:SetText(rec.name or format("spell %d", rec.id))
             row.meta:SetText(MetaLine(rec))
-            row.when:SetText(Ago(rec.last))
-            row.count:SetText(format("%dx", rec.n))
+            -- A boss ability nobody has met has no "when" and no count, so
+            -- the two columns say where it comes from instead.
+            if rec.n == 0 and (rec.instance or rec.encounter) then
+                row.when:SetText(rec.instance or "")
+                row.count:SetText(rec.encounter or "")
+            else
+                row.when:SetText(Ago(rec.last))
+                row.count:SetText(format("%dx", rec.n))
+            end
             -- Dimmed rather than hidden: an ignored debuff is still something
             -- you might want to look at, revisit, or un-ignore, and a filter
             -- that removed it from its own management screen would be the one
@@ -386,9 +414,10 @@ function Redraw()
 
     panel.empty:SetShown(#records == 0)
     if #records == 0 then
-        panel.empty:SetText(s.total == 0
+        panel.empty:SetText((s.total == 0 and s.catalog == 0)
             and "Nothing recorded yet.\n\nDebuffs are written down as they land "
-                .. "on you -- go and\ntake some."
+                .. "on you -- go and\ntake some. Or pre-fill this expansion's boss "
+                .. "abilities\nwith the button below."
             or "No debuff here matches that filter.")
     end
 
@@ -397,15 +426,16 @@ function Redraw()
         marks = format("  --  %d important, %d ignored", important, ignored)
     end
 
+    local pre = ""
+    if s.catalog > 0 then
+        pre = format("  --  %d boss abilities pre-filled", s.catalog)
+    end
+
     panel.footer:SetText(format(
-        "%d recorded of %d  --  recording %s  --  aura reads here %s, combat log %s%s",
-        s.total, s.cap,
+        "%d recorded of %d%s  --  recording %s  --  aura reads here %s%s",
+        s.total, s.cap, pre,
         s.recording and "|cff00ff00on|r" or "|cffff4040off|r",
         s.restricted and "|cffff8000refused|r" or "|cff00ff00allowed|r",
-        (not s.fromLog) and "|cff808080off|r"
-            or (not s.logAllowed) and "|cffff4040refused|r"
-            or (not s.logOpen) and "|cffff4040unusable|r"
-            or "|cff00ff00on|r",
         marks))
 
     for i = 1, #mine do
@@ -422,6 +452,23 @@ end
 local function Scroll(by)
     offset = offset + by
     Redraw()
+end
+
+-- The button and /tt debuffs prefill both land here, so the two say the same
+-- thing about what happened. The walk is the module's; this only reports it.
+local function Prefill()
+    local n, err = ns.PrefillDebuffs()
+    if not n then
+        ns.Print("|cffff4040could not pre-fill the journal:|r " .. tostring(err))
+    else
+        local s = ns.DebuffStats()
+        ns.Print(format("pre-filled %d boss abilit%s from %d instance%s%s.",
+                        n, n == 1 and "y" or "ies",
+                        s.catalogInstances, s.catalogInstances == 1 and "" or "s",
+                        s.catalogTier and (" of " .. s.catalogTier) or ""))
+    end
+    offset = 0
+    ns.RefreshDebuffs()
 end
 
 --------------------------------------------------------------------------------
@@ -589,6 +636,41 @@ local function BuildFooter(f)
         ns.ShowOptions()
     end)
 
+    y = y - 30
+    ui.Button(f, PAD, y, "Pre-fill boss abilities", function()
+        Prefill()
+    end, function()
+        return (ns.DebuffStats().catalog > 0) and "Pre-fill again (rebuild)"
+                                               or "Pre-fill boss abilities"
+    end)
+    ui.Check(f, WIDTH - PAD - ui.COL_W, y, "Show boss abilities not seen yet",
+             view, "catalog", function()
+        offset = 0
+        Redraw()
+    end)
+
+    -- Everything, for starting the list over: recorded debuffs, marked ones,
+    -- and the pre-filled catalog. "Forget everything recorded" above keeps
+    -- your marks and the catalog on purpose; this is the one that does not.
+    y = y - 30
+    ui.Button(f, PAD, y, "Clear everything, marks included", function()
+        if not armedAll then
+            armedAll = true
+            return
+        end
+        armedAll = false
+        local records, entries = ns.ClearDebuffJournal()
+        ns.Print(format("cleared %d recorded debuff%s and %d pre-filled "
+                        .. "abilit%s -- marks included.",
+                        records, records == 1 and "" or "s",
+                        entries, entries == 1 and "y" or "ies"))
+        offset = 0
+        Redraw()
+    end, function()
+        return armedAll and "|cffff4040Click again -- marks go too|r"
+                         or "Clear everything, marks included"
+    end)
+
     for i = first, #ui.controls do mine[#mine + 1] = ui.controls[i] end
 
     f:SetHeight(-y + 28 + PAD)
@@ -621,7 +703,7 @@ function ns.ShowDebuffs()
 
         -- Disarming on close rather than on open, so the window cannot be
         -- reopened onto a primed wipe.
-        panel:SetScript("OnHide", function() armed = false end)
+        panel:SetScript("OnHide", function() armed, armedAll = false, false end)
     end
 
     panel:Show()
@@ -648,20 +730,19 @@ ns.RegisterCommand{
     feature = "debuffs",
     section = "debuffs:",
     order   = 10,
-    args    = "[clear|log]",
+    args    = "[clear|clear all|prefill]",
     desc    = "the debuff journal -- everything that has landed on you",
     handler = function(_, larg)
-        if larg == "log" then
-            -- Asking again after a refusal was remembered. Says which answer
-            -- it got, because the whole point of the memory is that the
-            -- question stops being asked silently.
-            if ns.RetryDebuffLog() then
-                ns.Print("the combat log door is |cff00ff00open|r.")
-            else
-                ns.Print("the client still |cffff4040refuses|r the combat log. "
-                         .. "The journal records through the aura door only, "
-                         .. "which is shut inside encounters.")
-            end
+        if larg == "prefill" then
+            Prefill()
+            return
+        end
+        if larg == "clear all" then
+            local records, entries = ns.ClearDebuffJournal()
+            ns.Print(format("cleared %d recorded debuff%s and %d pre-filled "
+                            .. "abilit%s -- marks included.",
+                            records, records == 1 and "" or "s",
+                            entries, entries == 1 and "y" or "ies"))
             ns.RefreshDebuffs()
             return
         end
@@ -698,21 +779,6 @@ ns.RegisterOptionsSection{
         y = y - 6
 
         y = ui.Check(f, x, y, "Record debuffs", store, "djRecord")
-        -- Switching it on has to ask the client, because OnInit did not: the
-        -- registration is skipped entirely while this is off, so without this
-        -- the setting would look on and record nothing until a reload.
-        y = ui.Check(f, x, y, "Also record from the combat log", store,
-                     "djFromLog", function()
-            if store.djFromLog then ns.RetryDebuffLog() end
-            ns.RefreshDebuffs()
-        end)
-        y = ui.Note(f, x + 24, y + 4,
-            "The other door in an encounter, where the client allows\n"
-            .. "it at all -- some refuse to register for the combat log.\n"
-            .. "It carries a spell id and nothing else: no dispel type\n"
-            .. "and no raid or boss flags. /tt status says which doors\n"
-            .. "are open here.", ui.COL_W - 24)
-
         y = ui.Check(f, x, y, "Also learn boss abilities at the pull", store,
                      "djFromJournal", function() ns.RefreshDebuffs() end)
         y = ui.Note(f, x + 24, y + 4,

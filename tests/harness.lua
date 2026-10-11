@@ -478,10 +478,6 @@ WORLD = {
     -- raises, the way ADDON_ACTION_FORBIDDEN does. nil means everything is
     -- allowed, which is every scenario that does not say otherwise.
     forbiddenEvents = nil,
-    -- The interface version, as GetBuildInfo's fourth return. A refused combat
-    -- log is remembered against this, so bumping it is how a suite says "a
-    -- patch happened".
-    tocVersion   = 120000,
     zone         = "Elwynn Forest",
     instanceName = "Some Instance",
     -- token -> { exists, isPlayer, dead, combat, threat = {by unit},
@@ -756,45 +752,6 @@ C_Spell = {
     end,
 }
 
---------------------------------------------------------------------------------
--- The combat log
---
--- A different permission from a unit read, which is the point: it keeps
--- answering where C_UnitAuras stops. One line at a time, the way the client
--- delivers them -- the event fires and the addon asks for what is current.
---------------------------------------------------------------------------------
-
-local LOGLINE
-
-function CombatLogGetCurrentEventInfo()
-    if not LOGLINE then return end
-    return LOGLINE[1], LOGLINE[2], LOGLINE[3], LOGLINE[4], LOGLINE[5],
-           LOGLINE[6], LOGLINE[7], LOGLINE[8], LOGLINE[9], LOGLINE[10],
-           LOGLINE[11], LOGLINE[12], LOGLINE[13], LOGLINE[14], LOGLINE[15]
-end
-
--- destGUID defaults to us, which is the case every assertion cares about.
---
--- destFlags is position 10 and carries the affiliation bits. It defaults to
--- MINE for a line aimed at us and to RAID for one aimed at somebody else,
--- which is what the client actually sends -- a caller that wants to model an
--- unreadable mask passes SECRET explicitly.
-local AFFILIATION_MINE = 0x1
-local AFFILIATION_RAID = 0x4
-
-function FireCombatLog(sub, spellId, spellName, auraType, destGUID, destFlags)
-    if destFlags == nil then
-        destFlags = destGUID and AFFILIATION_RAID or AFFILIATION_MINE
-    end
-    LOGLINE = {
-        0, sub, false, "Creature-0-BOSS", "A Boss", 0, 0,
-        destGUID or WORLD.guid, "Tankadin", destFlags, 0,
-        spellId, spellName, 1, auraType or "DEBUFF",
-    }
-    FireEvent("COMBAT_LOG_EVENT_UNFILTERED")
-    LOGLINE = nil
-end
-
 -- guidSecret covers every unit, not just the player. The client does not
 -- restrict our own identity and leave the rest of the raid readable, and a
 -- harness that modelled it that way would let a co-tank feature pass a suite
@@ -807,8 +764,11 @@ function UnitGUID(u)
 end
 
 -- Where we are, in words. Never restricted -- the zone name is on the map.
+-- The 8th return is the game map id, which is how the journal instance you are
+-- standing in is found now that EJ_GetCurrentInstance is gone.
 function GetInstanceInfo()
-    return WORLD.instanceName or "Some Instance", WORLD.instanceType
+    return WORLD.instanceName or "Some Instance", WORLD.instanceType,
+           0, "", 5, 0, false, WORLD.instanceMapID or 0
 end
 
 function GetRealZoneText() return WORLD.zone or "Elwynn Forest" end
@@ -824,23 +784,71 @@ function GetRealZoneText() return WORLD.zone or "Elwynn Forest" end
 --
 -- WORLD.journal = {
 --   instance = <journalInstanceID>,
+--   mapID = <game map id>,     -- what GetInstanceInfo's 8th return maps from
 --   encounters = { { journalID =, dungeonID =, name =, root = } },
 --   sections = { [id] = { spellID =, title =, abilityIcon =,
 --                         firstChildSectionID =, siblingSectionID = } },
 -- }
+--
+-- The pre-fill walks a whole tier, so the Dungeon Journal's *selection* is
+-- modelled too, because that is what the addon has to borrow and give back:
+--
+-- WORLD.ejTiers = { { name =, dungeons = { inst... }, raids = { inst... } } }
+--   inst = { id =, name =, areaMap =, encounters = { { name =, root = } } }
+-- WORLD.ejTier          the selected tier, which EJ_GetInstanceByIndex reads
+-- WORLD.ejSections      section id -> section, for the tier walk
+-- WORLD.expansionLevel  GetServerExpansionLevel(), 0-based
+--
+-- There is deliberately no EJ_GetCurrentInstance: the client removed it in
+-- 8.0.1, and a harness that still defined it is how a door that never worked
+-- in game passed its suite.
 --------------------------------------------------------------------------------
 
-function EJ_GetCurrentInstance()
-    local j = WORLD.journal
-    return j and j.instance or 0
-end
-
 -- Records what the addon selected, so a suite can assert it did NOT repoint
--- the player's open Dungeon Journal when it did not have to.
+-- the player's open Dungeon Journal when it did not have to -- or that it put
+-- the selection back when it did.
 EJ_SELECTED = nil
 function EJ_SelectInstance(id) EJ_SELECTED = id end
 
+function EJ_GetNumTiers() return WORLD.ejTiers and #WORLD.ejTiers or 0 end
+function EJ_GetCurrentTier() return WORLD.ejTier or 1 end
+function EJ_SelectTier(i) WORLD.ejTier = i end
+function EJ_GetTierInfo(i)
+    local t = WORLD.ejTiers and WORLD.ejTiers[i]
+    return t and t.name
+end
+function GetServerExpansionLevel() return WORLD.expansionLevel or 0 end
+
+-- Reads the selected tier, as the real one does -- which is why the walk has
+-- to select a tier first and put the player's back afterwards.
+-- instanceID, name, description, bgImage, buttonImage1, loreImage,
+-- buttonImage2, dungeonAreaMapID, link, shouldDisplayDifficulty, mapID
+function EJ_GetInstanceByIndex(i, isRaid)
+    local t = WORLD.ejTiers and WORLD.ejTiers[WORLD.ejTier or 1]
+    local list = t and (isRaid and t.raids or t.dungeons)
+    local inst = list and list[i]
+    if not inst then return nil end
+    return inst.id, inst.name, "", nil, nil, nil, nil, inst.areaMap or 1, nil, true, 0
+end
+
+local function TierInstance(id)
+    for _, t in ipairs(WORLD.ejTiers or {}) do
+        for _, list in ipairs({ t.dungeons or {}, t.raids or {} }) do
+            for _, inst in ipairs(list) do
+                if inst.id == id then return inst end
+            end
+        end
+    end
+end
+
 function EJ_GetEncounterInfoByIndex(i, instanceID)
+    local inst = instanceID and TierInstance(instanceID)
+    if inst then
+        local e = inst.encounters and inst.encounters[i]
+        if not e then return nil end
+        return e.name, "", e.journalID or 0, e.root, nil, instanceID, e.dungeonID or 0, 0
+    end
+
     local j = WORLD.journal
     if not j then return nil end
 
@@ -858,10 +866,32 @@ function EJ_GetEncounterInfoByIndex(i, instanceID)
     return e.name, "", e.journalID, e.root, nil, j.instance, e.dungeonID, 0
 end
 
+-- The Adventure Guide's ability icons, as the client numbers them.
+Enum = Enum or {}
+Enum.JournalEncounterIconFlags = {
+    Tank = 1, Dps = 2, Healer = 4, Heroic = 8, Deadly = 16, Important = 32,
+    Interruptible = 64, Magic = 128, Curse = 256, Poison = 512, Disease = 1024,
+    Enrage = 2048, Mythic = 4096, Bleed = 8192,
+}
+
 C_EncounterJournal = {
+    -- Icon *indices* (the flag's bit position), not flag values -- the shape
+    -- Blizzard's own journal decodes. A section lists them as `icons`.
+    GetSectionIconFlags = function(id)
+        local j = WORLD.journal
+        local s = (j and j.sections and j.sections[id])
+                  or (WORLD.ejSections and WORLD.ejSections[id])
+        return s and s.icons or nil
+    end,
+    GetInstanceForGameMap = function(mapID)
+        local j = WORLD.journal
+        if j and j.mapID ~= nil and j.mapID == mapID then return j.instance end
+        return nil
+    end,
     GetSectionInfo = function(id)
         local j = WORLD.journal
-        local s = j and j.sections and j.sections[id]
+        local s = (j and j.sections and j.sections[id])
+                  or (WORLD.ejSections and WORLD.ejSections[id])
         if not s then return nil end
         return {
             spellID             = s.spellID,
@@ -872,12 +902,6 @@ C_EncounterJournal = {
         }
     end,
 }
-
--- version, build, date, tocversion. Only the fourth is read by the addon, to
--- date a combat log refusal so it is retried after a patch and not before.
-function GetBuildInfo()
-    return "12.1.0", "60000", "Sep  2 2026", WORLD.tocVersion
-end
 
 TIME = 1000
 function GetTime() return TIME end

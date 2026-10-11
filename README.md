@@ -288,33 +288,36 @@ willing to hand over. Hovering a row gives the game's own spell tooltip,
 description included, with what we know about it underneath. Filter by name or
 by id, sort by recency, name, or how often you have seen it.
 
-### Three doors, because the first is shut where it matters
+### Two doors
 
 | | What it gives | Where it works |
 |---|---|---|
 | the aura data | spell id, name, icon, dispel type, raid / boss / tank-role flags | anywhere the client will let an addon read auras |
-| the combat log | spell id, name | everywhere, including an encounter |
-| the Encounter Journal | spell id, name, icon — for the boss's whole ability list | everywhere, and **before anything lands** |
+| the Encounter Journal | spell id, name, icon, and its dispel / bleed / tank tags — for a boss's debuff abilities | everywhere, and **before anything lands** |
 
-The rich door is the one that closes. Inside an encounter or a Mythic+ the
-client refuses aura reads outright — exactly the content whose debuffs are
-worth cataloguing — so the combat log is read as well. `SPELL_AURA_APPLIED`
-carries a spell id and the word `DEBUFF`, and it is a log line rather than a
-unit read: a different permission, and one that is still open. The rest of the
-row comes from the spell database, because asking what spell 12345 is called is
-not a question about a unit and is answerable in a boss fight like anywhere
-else.
+The rich door narrows where it matters. Inside an encounter or a Mythic+ the
+client refuses aura *enumeration*, so the zone-in scan and the co-tank walks go
+quiet; the added-aura list on `UNIT_AURA` still arrives, because it is pushed
+rather than asked for, so debuffs landing on you are still recorded as they
+land. The name and icon fill in from the spell database, which is not a
+question about a unit and is answerable in a boss fight like anywhere else.
 
-What the log cannot give is the flags. A record it produced alone is marked
-**log only** rather than being drawn with five empty boxes, because "we never
-got to look" and "no, none of those" are different answers and only one of them
-is safe to act on. The same rule holds field by field: a flag read in a delve
-is never overwritten by a raid where the client refused to say.
+A flag the client would not say is left empty rather than written as "no",
+field by field: a flag read in a delve is never overwritten by a raid where the
+client refused to say.
 
-### The third door does not care who was hit
+**There used to be a third door, the combat log** (`SPELL_AURA_APPLIED`), read
+because it stayed open in an encounter. It is gone. On a client that protects
+`COMBAT_LOG_EVENT_UNFILTERED` the registration is refused and the player is
+shown an error for the attempt — at startup — and remembering the refusal per
+patch did not stop that in practice. A thinner journal inside encounters is the
+better trade than an addon that errors on login. Records it wrote earlier still
+read **log only**.
 
-The other two record what **landed**. The Encounter Journal records what the
-boss **can do**, which is a different fact and kept apart from the first two.
+### The Encounter Journal does not care who was hit
+
+The aura door records what **landed**. The Encounter Journal records what the
+boss **can do**, which is a different fact and kept apart from it.
 
 It works in an encounter for the same reason the spell database does: the
 Dungeon Journal is the game's own content data, not an answer about a unit, so
@@ -342,42 +345,57 @@ Never-seen entries are also the first to be dropped when the journal fills.
 Something that actually landed on you is the better record by definition, and
 it should not be evicted to keep a guess about a boss you never fought.
 
-### Whose debuffs, and how each one is recognised
+The current instance is found the way Blizzard's own Adventure Guide finds it:
+the game map id from `GetInstanceInfo`, mapped with
+`C_EncounterJournal.GetInstanceForGameMap`. An earlier version asked
+`EJ_GetCurrentInstance`, which the client removed in 8.0.1 — so this door never
+opened in game, while the test harness, which still defined the function,
+passed.
 
-Recognising a log line is a separate problem from reading it, and it is the one
-that used to shut the log door in a raid. `UnitGUID("player")` is a secret
-inside an instance, so matching the line's destination against our own GUID
-could never succeed — both doors closed at once, in exactly the content the
-second door exists for.
+### Pre-filling a whole expansion
 
-The affiliation bits on the line solve it for you. `destFlags` is a bitmask on
-a log line rather than an answer about a unit — the same permission that lets
-the log be read at all — and it says **mine** without anybody's identity being
-involved.
+The door above learns one boss at the pull. **Pre-fill boss abilities** in the
+journal window (or `/tt debuffs prefill`) walks every dungeon and raid of the
+current expansion ahead of time, so the list can be marked before you set foot
+in any of them.
 
-| | Recognised by | Works in an encounter |
-|---|---|---|
-| your own debuffs | the `MINE` affiliation bit | **yes** |
-| a co-tank's | a GUID match against the tank roster | no |
+- **Debuffs only.** The journal lists every ability a boss has, and nothing
+  on a spell says "this leaves a debuff". What the journal does carry is the
+  row of icons beside each ability in the Adventure Guide, and an ability is
+  kept only if it has one of six: Magic, Curse, Poison, Disease, Bleed, or the
+  Tank alert (how the journal marks a tank buster). The tags are shown on the
+  row. Two known gaps: Magic also marks a purgeable buff on the boss, and the
+  journal lists the spell a boss *casts*, which is not always the id of the
+  debuff it leaves — a real sighting records the real id. The same filter
+  applies to the boss learned at the pull.
+- **It is a separate catalog.** An expansion is several hundred spell ids and
+  the journal holds four hundred, dropping never-seen entries first — a
+  pre-fill written into it would evict itself. So the catalog counts against
+  nothing, the window shows it alongside what you recorded (**Show boss
+  abilities not seen yet**), and pre-filling again replaces it. Filtering by a
+  dungeon or boss name lists its abilities.
+- **Marking one moves it into the journal**, where a marked record is never
+  evicted, so the decision survives the next rebuild.
+- **It borrows the Adventure Guide's selection and gives it back.** Listing a
+  tier's instances only works on the *selected* tier, so the selected tier and
+  instance are saved, the walk runs in a single call — no frame is drawn with
+  the selection moved — and both are restored. It refuses while the Adventure
+  Guide is open, and in combat.
+- **Difficulty is never touched.** Abilities are collected across every
+  difficulty, which is the Mythic superset, without calling `EJ_SetDifficulty`.
+- The world-boss entry at the top of a tier's raid list is skipped.
 
-The mask distinguishes mine / party / raid and has **no notion of role**, so
-"is this line about a tank" is precisely the question it cannot answer — and a
-GUID is what an encounter takes away. Co-tank recording therefore works
-wherever the client still names people, and stops inside an encounter.
+### Whose debuffs
 
-That is stated rather than hidden: **`/tt status`** prints how many co-tanks
-were recognised and how many the client would not name, so a raid night that
-ends with none of the other tank's debuffs has a printed reason rather than
-looking like a feature that forgot to run.
+Yours, and the other tanks'. Your own come from the added-aura list and a
+zone-in scan; a co-tank's from one aura walk per tank, which works wherever the
+client lets an addon read auras and goes quiet inside an encounter, where it
+does not. The Encounter Journal door covers what neither reaches there: it
+lists the boss's debuffs whoever they land on.
 
 ### What it costs
 
-The combat log handler runs on every line of the log, which in a raid is
-thousands a second. It rejects on the subevent first and attributes a line only
-for the handful that survive that — arithmetic on a mask it already has, before
-any GUID lookup — and it can be switched off on its own — **Also record from
-the combat log** — leaving the aura door open. Recording as a whole is one
-checkbox too.
+Recording is one checkbox, **Record debuffs**.
 
 Co-tanks add one aura walk per tank, rate limited to once a second and skipped
 entirely wherever aura reads are refused.
@@ -565,7 +583,9 @@ typing, and for macros.
 | `/tt twtips` | toggle debuff tooltips on hover |
 | `/tt twhover` | toggle hover-casting on the bars |
 | `/tt debuffs` | open the debuff journal |
-| `/tt debuffs clear` | forget every recorded debuff |
+| `/tt debuffs clear` | forget every recorded debuff (keeps marks and the pre-filled catalog) |
+| `/tt debuffs clear all` | clear everything: recorded, marked and pre-filled |
+| `/tt debuffs prefill` | catalog every boss ability of the current expansion |
 | `/tt sound [name]` | toggle the lost-mob sound, or pick one — warning / bell / flag / low / medium / critical |
 | `/tt tankonly` | toggle tank-spec-only |
 | `/tt ictest` | preview the important-cast symbol on every nameplate |
@@ -676,8 +696,8 @@ Scenarios set up a different world before the addon loads:
 | `tankwatch:fresh` | a raid with three tanks, the co-tank flag set |
 | `tankwatch:secret` | the same raid with **every identity read restricted** |
 | `tankwatch:engine` | the same raid with an **aura display widget present and aura reads denied outright** -- a boss fight. The icons must be on screen and the addon must not have touched an aura API. |
-| `debuffs:fresh` | the journal with **both doors open** -- aura reads allowed, so a record can carry every flag there is |
-| `debuffs:secret` | the journal with **aura enumeration refused** -- the combat log has to keep it filling, and nothing may throw |
+| `debuffs:fresh` | the journal with **aura reads allowed**, so a record can carry every flag there is |
+| `debuffs:secret` | the journal with **aura enumeration refused** -- the added-aura list has to keep it filling, and nothing may throw |
 
 The last two are the important ones, and they model two *different*
 restrictions. `WORLD.secretMode = true` makes every `Unit*` call return a secret
